@@ -88,79 +88,52 @@ Use `aws:CalledViaAWSMCP` to restrict permissions to a specific MCP server. Use 
 
 ---
 
-### Pattern 1: Read-Only (Deny Write Actions)
+### Pattern 1: Read-Only
 
-Allow all MCP actions, then deny write/mutate operations across major services.
+Allow-list of read operations across major services. Safer than deny-list because unlisted actions are implicitly denied.
 
-> **Note:** A deny-list cannot be exhaustive — obscure or new service actions may slip through. For strict read-only enforcement, use `arn:aws:iam::aws:policy/ReadOnlyAccess` (AWS-managed, covers all services, no `aws:CalledViaAWSMCP` condition possible) or an SCP at the AWS Organizations level.
+> **Coverage note:** This list covers common services. For complete coverage of all AWS services, attach `arn:aws:iam::aws:policy/ReadOnlyAccess` instead (AWS-managed, automatically updated, but cannot carry the `aws:CalledViaAWSMCP` condition).
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "AllowAllViaMCP",
+      "Sid": "ReadOnlyViaMCP",
       "Effect": "Allow",
-      "Action": "*",
+      "Action": [
+        "ec2:Describe*", "ec2:Get*",
+        "s3:Get*", "s3:List*",
+        "rds:Describe*",
+        "ecs:Describe*", "ecs:List*",
+        "eks:Describe*", "eks:List*",
+        "lambda:Get*", "lambda:List*",
+        "cloudwatch:Describe*", "cloudwatch:Get*", "cloudwatch:List*",
+        "cloudtrail:Describe*", "cloudtrail:Get*", "cloudtrail:List*",
+        "iam:Get*", "iam:List*",
+        "ssm:Describe*", "ssm:Get*", "ssm:List*",
+        "dynamodb:Describe*", "dynamodb:List*", "dynamodb:Get*",
+        "kms:Describe*", "kms:Get*", "kms:List*",
+        "secretsmanager:Describe*", "secretsmanager:List*", "secretsmanager:GetResourcePolicy",
+        "logs:Describe*", "logs:Get*", "logs:List*", "logs:FilterLogEvents",
+        "sns:Get*", "sns:List*",
+        "sqs:Get*", "sqs:List*",
+        "ecr:Describe*", "ecr:Get*", "ecr:List*", "ecr:BatchGet*",
+        "elasticloadbalancing:Describe*",
+        "autoscaling:Describe*",
+        "cloudformation:Describe*", "cloudformation:Get*", "cloudformation:List*",
+        "route53:Get*", "route53:List*",
+        "events:Describe*", "events:List*",
+        "stepfunctions:Describe*", "stepfunctions:Get*", "stepfunctions:List*",
+        "apigateway:GET",
+        "cloudfront:Describe*", "cloudfront:Get*", "cloudfront:List*"
+      ],
       "Resource": "*",
       "Condition": {
         "StringEquals": {
           "aws:CalledViaAWSMCP": "aws-mcp.amazonaws.com"
         }
       }
-    },
-    {
-      "Sid": "DenyWriteActions",
-      "Effect": "Deny",
-      "Action": [
-        "ec2:Create*", "ec2:Delete*", "ec2:Modify*", "ec2:Put*",
-        "ec2:Terminate*", "ec2:Start*", "ec2:Stop*", "ec2:Reboot*",
-        "ec2:Attach*", "ec2:Detach*", "ec2:Associate*", "ec2:Disassociate*",
-        "ec2:Run*", "ec2:Import*", "ec2:Copy*",
-        "s3:Put*", "s3:Delete*", "s3:Create*", "s3:Restore*",
-        "rds:Create*", "rds:Delete*", "rds:Modify*", "rds:Restore*", "rds:Start*", "rds:Stop*",
-        "iam:Create*", "iam:Delete*", "iam:Put*", "iam:Update*",
-        "iam:Attach*", "iam:Detach*", "iam:PassRole", "iam:AddRoleToInstanceProfile",
-        "lambda:Create*", "lambda:Delete*", "lambda:Update*", "lambda:Put*",
-        "lambda:Add*", "lambda:Remove*", "lambda:Invoke*", "lambda:Publish*",
-        "ecs:Create*", "ecs:Delete*", "ecs:Update*", "ecs:Put*",
-        "ecs:Register*", "ecs:Deregister*", "ecs:Start*", "ecs:Stop*", "ecs:Submit*",
-        "eks:Create*", "eks:Delete*", "eks:Update*", "eks:Associate*", "eks:Register*",
-        "cloudformation:Create*", "cloudformation:Delete*", "cloudformation:Update*",
-        "cloudformation:Execute*", "cloudformation:Set*",
-        "dynamodb:Create*", "dynamodb:Delete*", "dynamodb:Update*",
-        "dynamodb:Put*", "dynamodb:Batch*", "dynamodb:Transact*",
-        "kms:Create*", "kms:Delete*", "kms:Update*", "kms:Disable*",
-        "kms:Enable*", "kms:Put*", "kms:Schedule*", "kms:Import*",
-        "secretsmanager:Create*", "secretsmanager:Delete*", "secretsmanager:Put*",
-        "secretsmanager:Update*", "secretsmanager:Rotate*", "secretsmanager:Cancel*",
-        "logs:Create*", "logs:Delete*", "logs:Put*", "logs:Tag*", "logs:Untag*",
-        "cloudwatch:Delete*", "cloudwatch:Put*", "cloudwatch:Set*", "cloudwatch:Tag*",
-        "route53:Create*", "route53:Delete*", "route53:Update*", "route53:Change*",
-        "sns:Create*", "sns:Delete*", "sns:Set*", "sns:Subscribe*",
-        "sns:Unsubscribe*", "sns:Publish*", "sns:Add*", "sns:Remove*",
-        "sqs:Create*", "sqs:Delete*", "sqs:Set*", "sqs:Send*",
-        "sqs:Purge*", "sqs:Change*", "sqs:Tag*",
-        "ecr:Create*", "ecr:Delete*", "ecr:Put*", "ecr:Initiate*",
-        "ecr:Upload*", "ecr:Batch*", "ecr:Set*", "ecr:Tag*",
-        "elasticloadbalancing:Create*", "elasticloadbalancing:Delete*",
-        "elasticloadbalancing:Modify*", "elasticloadbalancing:Register*",
-        "elasticloadbalancing:Deregister*", "elasticloadbalancing:Set*",
-        "autoscaling:Create*", "autoscaling:Delete*", "autoscaling:Update*",
-        "autoscaling:Set*", "autoscaling:Attach*", "autoscaling:Detach*",
-        "autoscaling:Execute*", "autoscaling:Put*",
-        "cloudfront:Create*", "cloudfront:Delete*", "cloudfront:Update*",
-        "cloudfront:Associate*", "cloudfront:Publish*", "cloudfront:Tag*",
-        "ssm:Create*", "ssm:Delete*", "ssm:Update*", "ssm:Put*",
-        "ssm:Register*", "ssm:Deregister*", "ssm:Start*", "ssm:Stop*",
-        "ssm:Send*", "ssm:Cancel*", "ssm:Label*",
-        "events:Create*", "events:Delete*", "events:Put*",
-        "events:Update*", "events:Enable*", "events:Disable*", "events:Tag*",
-        "stepfunctions:Create*", "stepfunctions:Delete*", "stepfunctions:Update*",
-        "stepfunctions:Start*", "stepfunctions:Stop*", "stepfunctions:Send*",
-        "apigateway:POST", "apigateway:PUT", "apigateway:PATCH", "apigateway:DELETE"
-      ],
-      "Resource": "*"
     }
   ]
 }
@@ -305,9 +278,16 @@ aws iam put-role-policy \
 
 ### Pattern 4: Operational Investigation
 
-> ⚠️ **This pattern grants execution-level permissions**, not read-only. `ssm:SendCommand`, `ecs:ExecuteCommand`, and `lambda:InvokeFunction` can affect running systems. These are essential for incident investigation — use only for trusted on-call engineers and SRE workflows with CloudTrail audit logging enabled.
+> ⚠️ **This pattern grants remote execution permissions**, not read-only.
+> - `ssm:SendCommand` / `ecs:ExecuteCommand` — equivalent to remote shell access on instances and containers. Can read secrets, credentials, and filesystem data.
+> - `lambda:InvokeFunction` — executes business logic with potential side effects.
+>
+> **Required audit logging** (CloudTrail alone is insufficient):
+> - SSM Session Manager: enable session logging to S3/CloudWatch Logs
+> - ECS Exec: enable `execute-command` logging in task definition
+> - Lambda: enable function-level CloudWatch Logs
 
-Read access plus log querying, distributed tracing, Lambda invocation, and remote shell access for incident investigation.
+Read access plus log querying, distributed tracing, Lambda invocation, and remote shell for incident investigation.
 
 ```json
 {
@@ -395,6 +375,15 @@ All users who authenticate via OIDC share the same IAM role attached to the gate
 This means:
 - Every authenticated user inherits the full permissions of the gateway's IAM role
 - If you need per-user permission boundaries, deploy separate gateway instances with separate roles, or restrict who can authenticate via OIDC (`ALLOWED_EMAILS`, `ALLOWED_DOMAINS` in idproxy)
+
+### Audit Traceability
+
+CloudTrail records downstream AWS API calls under the **gateway's IAM role**, not the individual user. This means you cannot distinguish *which user* triggered a specific AWS API call from CloudTrail alone.
+
+To correlate user identity with AWS actions:
+- Enable access logging in the gateway (OIDC `sub` / email per request)
+- Cross-reference gateway request logs with CloudTrail by timestamp and source IP
+- For Pattern 4 (Operational Investigation), additionally enable SSM session logging and ECS Exec logging
 
 ## Quick Start
 
