@@ -67,7 +67,9 @@ func newSigV4RoundTripper(ctx context.Context, region, service string) (*sigV4Ro
 	// a different AWS account or a role with narrower permissions.
 	if assumeRoleARN := os.Getenv("ASSUME_ROLE_ARN"); assumeRoleARN != "" {
 		stsClient := sts.NewFromConfig(cfg)
-		provider := stscreds.NewAssumeRoleProvider(stsClient, assumeRoleARN)
+		provider := stscreds.NewAssumeRoleProvider(stsClient, assumeRoleARN, func(o *stscreds.AssumeRoleOptions) {
+			o.RoleSessionName = "aws-mcp-gateway"
+		})
 		cfg.Credentials = aws.NewCredentialsCache(provider)
 		slog.Info("using assumed role", "role_arn", assumeRoleARN)
 	}
