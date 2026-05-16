@@ -48,12 +48,12 @@ AWS 認証情報は環境から自動解決されます（Lambda 実行ロール
 |------|------|-----------|
 | `OIDC_CLIENT_SECRET` | OAuth クライアントシークレット | なし |
 | `COOKIE_SECRET` | Cookie 暗号化キー（hex 形式、32バイト以上） | ランダム生成（再起動でセッション消失） |
-| `AWS_MCP_ENDPOINT` | AWS MCP Server エンドポイント URL | `https://aws-mcp.us-east-1.api.aws/mcp` |
+| `AWS_MCP_ENDPOINT` | AWS MCP Server エンドポイント URL（`AWS_MCP_REGION` より優先） | `AWS_MCP_REGION` から自動生成 |
 | `AWS_MCP_REGION` | AWS MCP Server エンドポイントのリージョン | `us-east-1` |
 | `TARGET_AWS_REGION` | AWS API 操作のデフォルトリージョン | `ap-northeast-1` |
 | `PORT` | リスンポート | `8080` |
 
-> **Note:** `AWS_MCP_REGION` は MCP サーバーエンドポイントがホストされているリージョン（`us-east-1` または `eu-central-1`）です。`TARGET_AWS_REGION` は AWS の操作対象リージョンです。両者は異なっていて構いません（例：us-east-1 エンドポイント経由で ap-northeast-1 のリソースを操作）。
+> **Note:** `AWS_MCP_REGION` は接続先の MCP サーバーエンドポイントのリージョン（`us-east-1` または `eu-central-1`）です。新しいリージョンが追加された場合はこの変数を変更するだけで対応できます。`TARGET_AWS_REGION` は AWS の操作対象リージョンで、両者は異なっていて構いません。
 
 ## OIDC プロバイダー設定
 
@@ -71,7 +71,58 @@ OIDC プロバイダーにこのゲートウェイをクライアントとして
 
 ## IAM 権限
 
-ランタイム環境（Lambda、ECS、EC2）に付与する IAM ロールに `aws-mcp` サービスへのアクセスを許可してください：
+ランタイム環境（Lambda、ECS、EC2）に付与する IAM ロールが、MCP エージェントが実行できる AWS 操作を制御します。用途に合わせてパターンを選択してください。
+
+### パターン 1: 読み取り専用（Read-Only）
+
+describe・list・get 操作のみ許可。安全な調査や閲覧に適しています。
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "aws-marketplace:View*",
+        "*:Describe*",
+        "*:Get*",
+        "*:List*",
+        "*:View*",
+        "*:Search*",
+        "*:Lookup*",
+        "*:BatchGet*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+```bash
+# ロールを作成（ECS タスク用の例）
+aws iam create-role \
+  --role-name aws-mcp-gateway-readonly \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+aws iam put-role-policy \
+  --role-name aws-mcp-gateway-readonly \
+  --policy-name mcp-readonly \
+  --policy-document file://policy-readonly.json
+```
+
+---
+
+### パターン 2: 全権限（Full Access）
+
+全 AWS サービスへの完全なアクセス。サンドボックスや個人アカウントのみで使用してください。
 
 ```json
 {
@@ -80,18 +131,138 @@ OIDC プロバイダーにこのゲートウェイをクライアントとして
     {
       "Effect": "Allow",
       "Action": "*",
-      "Resource": "*",
-      "Condition": {
-        "StringEquals": {
-          "aws:CalledViaFirst": "mcp.amazonaws.com"
-        }
-      }
+      "Resource": "*"
     }
   ]
 }
 ```
 
-細かいアクセス制御については [Understanding IAM for managed AWS MCP servers](https://aws.amazon.com/blogs/security/understanding-iam-for-managed-aws-mcp-servers/) を参照してください。
+```bash
+aws iam attach-role-policy \
+  --role-name aws-mcp-gateway-full \
+  --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
+```
+
+---
+
+### パターン 3: 削除禁止（No Delete）
+
+全操作を許可しつつ、削除・終了・削除系の操作を拒否します。リソースの作成・変更は許可しつつ誤削除を防ぎたいステージング環境に適しています。
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "*",
+      "Resource": "*"
+    },
+    {
+      "Effect": "Deny",
+      "Action": [
+        "*:Delete*",
+        "*:Terminate*",
+        "*:Remove*",
+        "*:Deregister*",
+        "*:Detach*",
+        "*:Destroy*",
+        "*:Purge*",
+        "s3:DeleteObject*",
+        "s3:DeleteBucket*",
+        "ec2:TerminateInstances",
+        "rds:DeleteDBInstance",
+        "rds:DeleteDBCluster",
+        "dynamodb:DeleteTable",
+        "lambda:DeleteFunction"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+```bash
+aws iam create-role \
+  --role-name aws-mcp-gateway-nodelete \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+aws iam put-role-policy \
+  --role-name aws-mcp-gateway-nodelete \
+  --policy-name mcp-nodelete \
+  --policy-document file://policy-nodelete.json
+```
+
+---
+
+### パターン 4: 読み取り専用＋デバッグ（Read-Only + Debug）
+
+読み取り専用に加えて、ログのクエリ・トレース参照・Lambda invoke・SSM セッションなど、障害調査や運用に必要な操作を許可します。オンコールエンジニアや SRE 向けです。
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "*:Describe*",
+        "*:Get*",
+        "*:List*",
+        "*:View*",
+        "*:Search*",
+        "*:Lookup*",
+        "*:BatchGet*",
+        "logs:FilterLogEvents",
+        "logs:GetLogEvents",
+        "logs:StartQuery",
+        "logs:StopQuery",
+        "logs:GetQueryResults",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+        "cloudtrail:LookupEvents",
+        "xray:GetTraceSummaries",
+        "xray:BatchGetTraces",
+        "xray:GetInsightSummaries",
+        "lambda:InvokeFunction",
+        "ssm:StartSession",
+        "ssm:SendCommand",
+        "ecs:ExecuteCommand"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+```bash
+aws iam create-role \
+  --role-name aws-mcp-gateway-debug \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+aws iam put-role-policy \
+  --role-name aws-mcp-gateway-debug \
+  --policy-name mcp-debug \
+  --policy-document file://policy-debug.json
+```
+
+---
+
+詳細な IAM 条件キーの活用については [Understanding IAM for managed AWS MCP servers](https://aws.amazon.com/blogs/security/understanding-iam-for-managed-aws-mcp-servers/) を参照してください。
 
 ## クイックスタート
 
@@ -102,7 +273,7 @@ export OIDC_CLIENT_ID=your-client-id
 export OIDC_CLIENT_SECRET=your-client-secret
 export COOKIE_SECRET=$(openssl rand -hex 32)
 
-go run .
+aws-mcp-gateway
 ```
 
 ### MCP クライアント設定（Claude Code）

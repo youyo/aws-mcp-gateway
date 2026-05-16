@@ -48,12 +48,12 @@ AWS credentials are resolved automatically from the environment (Lambda executio
 |----------|-------------|---------|
 | `OIDC_CLIENT_SECRET` | OAuth Client Secret | none |
 | `COOKIE_SECRET` | Cookie encryption key (hex-encoded, 32+ bytes) | Random (sessions lost on restart) |
-| `AWS_MCP_ENDPOINT` | AWS MCP Server endpoint URL | `https://aws-mcp.us-east-1.api.aws/mcp` |
+| `AWS_MCP_ENDPOINT` | AWS MCP Server endpoint URL (overrides `AWS_MCP_REGION`) | derived from `AWS_MCP_REGION` |
 | `AWS_MCP_REGION` | Region of the AWS MCP Server endpoint | `us-east-1` |
 | `TARGET_AWS_REGION` | Default AWS region for API operations | `ap-northeast-1` |
 | `PORT` | Listen port | `8080` |
 
-> **Note:** `AWS_MCP_REGION` is the region where the MCP server endpoint is hosted (`us-east-1` or `eu-central-1`). `TARGET_AWS_REGION` is the region where AWS operations are performed — these can be different.
+> **Note:** `AWS_MCP_REGION` controls which MCP server endpoint to connect to (`us-east-1` or `eu-central-1`). When a new region becomes available, just change this variable. `TARGET_AWS_REGION` sets the default region for AWS operations — these can be different.
 
 ## Provider Setup
 
@@ -71,7 +71,58 @@ Register the gateway as an OIDC client and set the redirect URI to:
 
 ## IAM Permissions
 
-The IAM role attached to the runtime (Lambda, ECS, EC2) must allow the `aws-mcp` service:
+The IAM role attached to the runtime (Lambda, ECS, EC2) controls what AWS operations the MCP agent can perform. Choose a pattern that fits your use case.
+
+### Pattern 1: Read-Only
+
+Safe for read-only exploration — describe, list, and get operations only.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "aws-marketplace:View*",
+        "*:Describe*",
+        "*:Get*",
+        "*:List*",
+        "*:View*",
+        "*:Search*",
+        "*:Lookup*",
+        "*:BatchGet*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+```bash
+# Create role (example: for ECS task)
+aws iam create-role \
+  --role-name aws-mcp-gateway-readonly \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+aws iam put-role-policy \
+  --role-name aws-mcp-gateway-readonly \
+  --policy-name mcp-readonly \
+  --policy-document file://policy-readonly.json
+```
+
+---
+
+### Pattern 2: Full Access
+
+Full access to all AWS services. Use only in sandbox or personal accounts.
 
 ```json
 {
@@ -80,18 +131,138 @@ The IAM role attached to the runtime (Lambda, ECS, EC2) must allow the `aws-mcp`
     {
       "Effect": "Allow",
       "Action": "*",
-      "Resource": "*",
-      "Condition": {
-        "StringEquals": {
-          "aws:CalledViaFirst": "mcp.amazonaws.com"
-        }
-      }
+      "Resource": "*"
     }
   ]
 }
 ```
 
-Refer to [Understanding IAM for managed AWS MCP servers](https://aws.amazon.com/blogs/security/understanding-iam-for-managed-aws-mcp-servers/) for fine-grained control.
+```bash
+aws iam attach-role-policy \
+  --role-name aws-mcp-gateway-full \
+  --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
+```
+
+---
+
+### Pattern 3: No Delete (Deny Destructive Actions)
+
+Full access except for delete, terminate, and remove operations. Suitable for staging environments where provisioning is allowed but accidental deletion must be prevented.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "*",
+      "Resource": "*"
+    },
+    {
+      "Effect": "Deny",
+      "Action": [
+        "*:Delete*",
+        "*:Terminate*",
+        "*:Remove*",
+        "*:Deregister*",
+        "*:Detach*",
+        "*:Destroy*",
+        "*:Purge*",
+        "s3:DeleteObject*",
+        "s3:DeleteBucket*",
+        "ec2:TerminateInstances",
+        "rds:DeleteDBInstance",
+        "rds:DeleteDBCluster",
+        "dynamodb:DeleteTable",
+        "lambda:DeleteFunction"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+```bash
+aws iam create-role \
+  --role-name aws-mcp-gateway-nodelete \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+aws iam put-role-policy \
+  --role-name aws-mcp-gateway-nodelete \
+  --policy-name mcp-nodelete \
+  --policy-document file://policy-nodelete.json
+```
+
+---
+
+### Pattern 4: Read-Only + Debug
+
+Read-only access plus the ability to query logs, traces, and invoke Lambda for investigation. Useful for on-call engineers and SRE workflows.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "*:Describe*",
+        "*:Get*",
+        "*:List*",
+        "*:View*",
+        "*:Search*",
+        "*:Lookup*",
+        "*:BatchGet*",
+        "logs:FilterLogEvents",
+        "logs:GetLogEvents",
+        "logs:StartQuery",
+        "logs:StopQuery",
+        "logs:GetQueryResults",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+        "cloudtrail:LookupEvents",
+        "xray:GetTraceSummaries",
+        "xray:BatchGetTraces",
+        "xray:GetInsightSummaries",
+        "lambda:InvokeFunction",
+        "ssm:StartSession",
+        "ssm:SendCommand",
+        "ecs:ExecuteCommand"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+```bash
+aws iam create-role \
+  --role-name aws-mcp-gateway-debug \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+aws iam put-role-policy \
+  --role-name aws-mcp-gateway-debug \
+  --policy-name mcp-debug \
+  --policy-document file://policy-debug.json
+```
+
+---
+
+Refer to [Understanding IAM for managed AWS MCP servers](https://aws.amazon.com/blogs/security/understanding-iam-for-managed-aws-mcp-servers/) for further details on IAM condition keys.
 
 ## Quick Start
 
@@ -102,7 +273,7 @@ export OIDC_CLIENT_ID=your-client-id
 export OIDC_CLIENT_SECRET=your-client-secret
 export COOKIE_SECRET=$(openssl rand -hex 32)
 
-go run .
+aws-mcp-gateway
 ```
 
 ### MCP Client Configuration (Claude Code)
