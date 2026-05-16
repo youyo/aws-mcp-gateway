@@ -20,11 +20,11 @@ Every resource (Lambda function, DynamoDB table, SSM parameters, IAM roles) is n
 
 | Example `INSTANCE_NAME` | Use case |
 |---|---|
-| `mcp-gateway` | Single deployment (default) |
-| `mcp-gateway-prod` | Production account gateway |
-| `mcp-gateway-sandbox` | Sandbox account gateway |
+| `amg` | Single deployment (default) |
+| `amg-prod` | Production account gateway |
+| `amg-sandbox` | Sandbox account gateway |
 
-> ⚠️ **SSM restriction**: `INSTANCE_NAME` must **not** start with `aws`. AWS SSM Parameter Store reserves the `/aws` namespace, so a name like `aws-mcp-gateway` will result in `AccessDeniedException` when creating parameters.
+> ⚠️ **SSM restriction**: `INSTANCE_NAME` must **not** start with `aws`. AWS SSM Parameter Store reserves the `/aws` namespace and will return `AccessDeniedException` for any parameter path beginning with `/aws`.
 
 `INSTANCE_NAME` must be set as a **GitHub Actions Variable** (`vars.INSTANCE_NAME`) for CI deployment, or as an environment variable for manual deployment.
 
@@ -280,10 +280,10 @@ aws ssm put-parameter --region $REGION --type String --name /${INSTANCE_NAME}/AS
 
 ```bash
 # Set INSTANCE_NAME first — used throughout all subsequent commands
-export INSTANCE_NAME=aws-mcp-gateway-prod
+export INSTANCE_NAME=amg          # default; use amg-prod / amg-sandbox etc. for multiple deployments
 export AWS_REGION=ap-northeast-1
 
-VERSION=0.3.0  # update to latest release
+VERSION=0.5.2  # update to latest release
 curl -fsSL -o aws-mcp-gateway.tar.gz \
   "https://github.com/youyo/aws-mcp-gateway/releases/download/v${VERSION}/aws-mcp-gateway_${VERSION}_Linux_arm64.tar.gz"
 tar xzf aws-mcp-gateway.tar.gz aws-mcp-gateway
@@ -310,7 +310,7 @@ lambroll deploy \
 
 ```bash
 # INSTANCE_NAME and AWS_REGION must be set (from Step 1, or re-export here)
-export INSTANCE_NAME=aws-mcp-gateway-prod
+export INSTANCE_NAME=amg
 export AWS_REGION=ap-northeast-1
 
 # Get the Function URL
@@ -359,7 +359,7 @@ Copy `.github/workflows/deploy.yml` to your repository and set:
 
 | Variable | Value |
 |---|---|
-| `vars.INSTANCE_NAME` | Instance name e.g. `aws-mcp-gateway-prod` |
+| `vars.INSTANCE_NAME` | Instance name e.g. `amg-prod` |
 | `vars.AWS_DEPLOY_ROLE_ARN` | Deploy role ARN (`${INSTANCE_NAME}-deploy-role`) |
 | `vars.LAMBDA_ROLE_ARN` | Lambda execution role ARN (`${INSTANCE_NAME}-lambda-role`) |
 
@@ -368,8 +368,8 @@ Copy `.github/workflows/deploy.yml` to your repository and set:
 ### Single account
 
 ```bash
-# Get Function URL (replace aws-mcp-gateway-prod with your INSTANCE_NAME)
-aws lambda get-function-url-config --function-name aws-mcp-gateway-prod \
+# Get Function URL (replace amg with your INSTANCE_NAME)
+aws lambda get-function-url-config --function-name amg \
   --query 'FunctionUrl' --output text
 ```
 
