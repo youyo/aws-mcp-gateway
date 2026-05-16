@@ -102,6 +102,15 @@ func (t *sigV4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
+	// デバッグ: 送信ボディを一時ログ出力
+	if len(bodyBytes) > 0 {
+		dbg := string(bodyBytes)
+		if len(dbg) > 500 {
+			dbg = dbg[:500] + "..."
+		}
+		slog.Info("sigv4 request body", "body", dbg)
+	}
+
 	hash := sha256.Sum256(bodyBytes)
 	payloadHash := fmt.Sprintf("%x", hash)
 
