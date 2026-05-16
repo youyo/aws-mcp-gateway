@@ -284,7 +284,7 @@ All three permissions should show a green checkmark.
 After the initial Lambda deploy (Step 6 in Deploy), add the redirect URI:
 
 1. Left menu → **Authentication** → **Add a platform** → **Web**
-2. **Redirect URI**: `https://<function-url-id>.lambda-url.ap-northeast-1.on.aws/auth/callback`
+2. **Redirect URI**: `https://<function-url-id>.lambda-url.ap-northeast-1.on.aws/callback`
 3. Click **Configure**
 
 ---

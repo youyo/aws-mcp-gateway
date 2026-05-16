@@ -73,7 +73,7 @@ aws ssm put-parameter \
 echo "Updated /${INSTANCE_NAME}/EXTERNAL_URL -> ${FUNCTION_URL%/}"
 echo ""
 echo "Next: set redirect URI in Entra ID:"
-echo "  ${FUNCTION_URL%/}/auth/callback"
+echo "  ${FUNCTION_URL%/}/callback"
 echo ""
 echo "Then re-deploy:"
 echo "  mise run deploy"
