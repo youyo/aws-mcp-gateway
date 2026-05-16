@@ -143,8 +143,13 @@ func main() {
 	ctx := context.Background()
 
 	// Configuration
-	mcpEndpoint := getEnvOrDefault("AWS_MCP_ENDPOINT", defaultAWSMCPEndpoint)
 	mcpRegion := getEnvOrDefault("AWS_MCP_REGION", defaultMCPRegion)
+	// AWS_MCP_ENDPOINT takes precedence; otherwise derive from AWS_MCP_REGION.
+	// This allows future regions (e.g. ap-northeast-1) to work by just changing AWS_MCP_REGION.
+	mcpEndpoint := os.Getenv("AWS_MCP_ENDPOINT")
+	if mcpEndpoint == "" {
+		mcpEndpoint = fmt.Sprintf("https://aws-mcp.%s.api.aws/mcp", mcpRegion)
+	}
 	targetAWSRegion := getEnvOrDefault("TARGET_AWS_REGION", defaultTargetAWSRegion)
 	port := getEnvOrDefault("PORT", defaultListenPort)
 	externalURL := mustEnv("EXTERNAL_URL")
