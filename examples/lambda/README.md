@@ -20,9 +20,11 @@ Every resource (Lambda function, DynamoDB table, SSM parameters, IAM roles) is n
 
 | Example `INSTANCE_NAME` | Use case |
 |---|---|
-| `aws-mcp-gateway` | Single deployment (default) |
-| `aws-mcp-gateway-prod` | Production account gateway |
-| `aws-mcp-gateway-sandbox` | Sandbox account gateway |
+| `mcp-gateway` | Single deployment (default) |
+| `mcp-gateway-prod` | Production account gateway |
+| `mcp-gateway-sandbox` | Sandbox account gateway |
+
+> ⚠️ **SSM restriction**: `INSTANCE_NAME` must **not** start with `aws`. AWS SSM Parameter Store reserves the `/aws` namespace, so a name like `aws-mcp-gateway` will result in `AccessDeniedException` when creating parameters.
 
 `INSTANCE_NAME` must be set as a **GitHub Actions Variable** (`vars.INSTANCE_NAME`) for CI deployment, or as an environment variable for manual deployment.
 
