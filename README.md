@@ -73,30 +73,48 @@ Register the gateway as an OIDC client and set the redirect URI to:
 
 The IAM role attached to the runtime (Lambda, ECS, EC2) controls what AWS operations the MCP agent can perform. Choose a pattern that fits your use case.
 
+### IAM Condition Keys
+
+AWS MCP Server injects two condition keys into every downstream AWS API call:
+
+| Key | Description | Example value |
+|-----|-------------|---------------|
+| `aws:CalledViaAWSMCP` | Service principal of the MCP server making the call | `aws-mcp.amazonaws.com` |
+| `aws:ViaAWSMCPService` | Boolean — `"true"` when called via any managed MCP server | `"true"` |
+
+Use `aws:CalledViaAWSMCP` to restrict permissions to a specific MCP server. Use `aws:ViaAWSMCPService` to allow/deny all managed MCP servers at once.
+
+> **Reference:** [Understanding IAM for managed AWS MCP servers](https://aws.amazon.com/blogs/security/understanding-iam-for-managed-aws-mcp-servers/)
+
+---
+
 ### Pattern 1: Read-Only
 
-Safe for read-only exploration — describe, list, and get operations only.
+Read-only access to common services. Suitable for safe exploration and auditing.
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "ReadOnlyViaMCP",
       "Effect": "Allow",
       "Action": [
-        "aws-marketplace:View*",
-        "*:Describe*",
-        "*:Get*",
-        "*:List*",
-        "*:View*",
-        "*:Search*",
-        "*:Lookup*",
-        "*:BatchGet*"
+        "ec2:Describe*", "ec2:Get*",
+        "s3:Get*", "s3:List*",
+        "rds:Describe*",
+        "ecs:Describe*", "ecs:List*",
+        "eks:Describe*", "eks:List*",
+        "lambda:Get*", "lambda:List*",
+        "cloudwatch:Describe*", "cloudwatch:Get*", "cloudwatch:List*",
+        "cloudtrail:Describe*", "cloudtrail:Get*", "cloudtrail:List*",
+        "iam:Get*", "iam:List*",
+        "ssm:Describe*", "ssm:Get*", "ssm:List*"
       ],
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:CalledViaFirst": "mcp.amazonaws.com"
+          "aws:CalledViaAWSMCP": "aws-mcp.amazonaws.com"
         }
       }
     }
@@ -127,19 +145,20 @@ aws iam put-role-policy \
 
 ### Pattern 2: Full Access
 
-Full access to all AWS services. Use only in sandbox or personal accounts.
+Full access to all AWS services via MCP. Use only in sandbox or personal accounts.
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "FullAccessViaMCP",
       "Effect": "Allow",
       "Action": "*",
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:CalledViaFirst": "mcp.amazonaws.com"
+          "aws:CalledViaAWSMCP": "aws-mcp.amazonaws.com"
         }
       }
     }
@@ -148,48 +167,58 @@ Full access to all AWS services. Use only in sandbox or personal accounts.
 ```
 
 ```bash
-aws iam attach-role-policy \
+aws iam create-role \
   --role-name aws-mcp-gateway-full \
-  --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+aws iam put-role-policy \
+  --role-name aws-mcp-gateway-full \
+  --policy-name mcp-full \
+  --policy-document file://policy-full.json
 ```
 
 ---
 
 ### Pattern 3: No Delete (Deny Destructive Actions)
 
-Full access except for delete, terminate, and remove operations. Suitable for staging environments where provisioning is allowed but accidental deletion must be prevented.
+Full MCP access but explicitly denies destructive operations. The Deny has no MCP condition — it blocks deletion regardless of how the call arrives.
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "AllowAllViaMCP",
       "Effect": "Allow",
       "Action": "*",
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:CalledViaFirst": "mcp.amazonaws.com"
+          "aws:CalledViaAWSMCP": "aws-mcp.amazonaws.com"
         }
       }
     },
     {
+      "Sid": "DenyDestructiveActions",
       "Effect": "Deny",
       "Action": [
-        "*:Delete*",
-        "*:Terminate*",
-        "*:Remove*",
-        "*:Deregister*",
-        "*:Detach*",
-        "*:Destroy*",
-        "*:Purge*",
-        "s3:DeleteObject*",
-        "s3:DeleteBucket*",
-        "ec2:TerminateInstances",
-        "rds:DeleteDBInstance",
-        "rds:DeleteDBCluster",
+        "s3:DeleteBucket", "s3:DeleteObject", "s3:DeleteObjects",
+        "ec2:TerminateInstances", "ec2:DeleteVpc", "ec2:DeleteSubnet",
+        "ec2:DeleteSecurityGroup", "ec2:DeleteInternetGateway",
+        "rds:DeleteDBInstance", "rds:DeleteDBCluster", "rds:DeleteDBSnapshot",
         "dynamodb:DeleteTable",
-        "lambda:DeleteFunction"
+        "lambda:DeleteFunction",
+        "ecs:DeleteCluster", "ecs:DeleteService",
+        "eks:DeleteCluster", "eks:DeleteNodegroup",
+        "iam:DeleteRole", "iam:DeletePolicy", "iam:DeleteUser",
+        "cloudformation:DeleteStack"
       ],
       "Resource": "*"
     }
@@ -219,42 +248,35 @@ aws iam put-role-policy \
 
 ### Pattern 4: Read-Only + Debug
 
-Read-only access plus the ability to query logs, traces, and invoke Lambda for investigation. Useful for on-call engineers and SRE workflows.
+Read-only access plus log querying, tracing, Lambda invocation, and remote shell access for incident investigation. Intended for on-call engineers and SRE workflows.
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "ReadOnlyPlusDebugViaMCP",
       "Effect": "Allow",
       "Action": [
-        "*:Describe*",
-        "*:Get*",
-        "*:List*",
-        "*:View*",
-        "*:Search*",
-        "*:Lookup*",
-        "*:BatchGet*",
-        "logs:FilterLogEvents",
-        "logs:GetLogEvents",
-        "logs:StartQuery",
-        "logs:StopQuery",
-        "logs:GetQueryResults",
-        "logs:DescribeLogGroups",
-        "logs:DescribeLogStreams",
-        "cloudtrail:LookupEvents",
-        "xray:GetTraceSummaries",
-        "xray:BatchGetTraces",
-        "xray:GetInsightSummaries",
+        "ec2:Describe*", "ec2:Get*",
+        "s3:Get*", "s3:List*",
+        "rds:Describe*",
+        "ecs:Describe*", "ecs:List*",
+        "eks:Describe*", "eks:List*",
+        "lambda:Get*", "lambda:List*",
         "lambda:InvokeFunction",
-        "ssm:StartSession",
-        "ssm:SendCommand",
+        "cloudwatch:Describe*", "cloudwatch:Get*", "cloudwatch:List*",
+        "logs:Describe*", "logs:Get*", "logs:FilterLogEvents",
+        "logs:StartQuery", "logs:StopQuery", "logs:GetQueryResults",
+        "cloudtrail:LookupEvents",
+        "xray:GetTraceSummaries", "xray:BatchGetTraces", "xray:GetInsightSummaries",
+        "ssm:StartSession", "ssm:SendCommand", "ssm:GetCommandInvocation",
         "ecs:ExecuteCommand"
       ],
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:CalledViaFirst": "mcp.amazonaws.com"
+          "aws:CalledViaAWSMCP": "aws-mcp.amazonaws.com"
         }
       }
     }
@@ -282,7 +304,28 @@ aws iam put-role-policy \
 
 ---
 
-Refer to [Understanding IAM for managed AWS MCP servers](https://aws.amazon.com/blogs/security/understanding-iam-for-managed-aws-mcp-servers/) for further details on IAM condition keys.
+### Deny All MCP Access (SCP / Emergency Lockout)
+
+Use this as a Service Control Policy (SCP) to completely block all MCP-originated actions across an account.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyAllViaMCP",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "Bool": {
+          "aws:ViaAWSMCPService": "true"
+        }
+      }
+    }
+  ]
+}
+```
 
 ## Quick Start
 

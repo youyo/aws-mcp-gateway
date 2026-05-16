@@ -53,7 +53,7 @@ AWS 認証情報は環境から自動解決されます（Lambda 実行ロール
 | `TARGET_AWS_REGION` | AWS API 操作のデフォルトリージョン | `ap-northeast-1` |
 | `PORT` | リスンポート | `8080` |
 
-> **Note:** `AWS_MCP_REGION` は接続先の MCP サーバーエンドポイントのリージョン（`us-east-1` または `eu-central-1`）です。新しいリージョンが追加された場合はこの変数を変更するだけで対応できます。`TARGET_AWS_REGION` は AWS の操作対象リージョンで、両者は異なっていて構いません。
+> **Note:** `AWS_MCP_REGION` は接続先 MCP サーバーエンドポイントのリージョンです。新リージョンが追加された場合はこの変数を変更するだけで対応できます。`TARGET_AWS_REGION` は AWS の操作対象リージョンで、両者は異なっていて構いません。
 
 ## OIDC プロバイダー設定
 
@@ -71,32 +71,50 @@ OIDC プロバイダーにこのゲートウェイをクライアントとして
 
 ## IAM 権限
 
-ランタイム環境（Lambda、ECS、EC2）に付与する IAM ロールが、MCP エージェントが実行できる AWS 操作を制御します。用途に合わせてパターンを選択してください。
+ランタイム環境（Lambda、ECS、EC2）に付与する IAM ロールが、MCP エージェントが実行できる AWS 操作を制御します。
+
+### IAM 条件キー
+
+AWS MCP Server はすべてのダウンストリーム AWS API コールに以下の条件キーを自動付与します：
+
+| キー | 説明 | 値の例 |
+|-----|------|--------|
+| `aws:CalledViaAWSMCP` | 呼び出し元 MCP サーバーのサービスプリンシパル | `aws-mcp.amazonaws.com` |
+| `aws:ViaAWSMCPService` | 管理 MCP サーバー経由の場合に `"true"` | `"true"` |
+
+`aws:CalledViaAWSMCP` で特定の MCP サーバーに絞り込み、`aws:ViaAWSMCPService` で全管理 MCP サーバーをまとめて制御します。
+
+> **参考:** [Understanding IAM for managed AWS MCP servers](https://aws.amazon.com/blogs/security/understanding-iam-for-managed-aws-mcp-servers/)
+
+---
 
 ### パターン 1: 読み取り専用（Read-Only）
 
-describe・list・get 操作のみ許可。安全な調査や閲覧に適しています。
+主要サービスへの読み取り専用アクセス。安全な調査・閲覧に適しています。
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "ReadOnlyViaMCP",
       "Effect": "Allow",
       "Action": [
-        "aws-marketplace:View*",
-        "*:Describe*",
-        "*:Get*",
-        "*:List*",
-        "*:View*",
-        "*:Search*",
-        "*:Lookup*",
-        "*:BatchGet*"
+        "ec2:Describe*", "ec2:Get*",
+        "s3:Get*", "s3:List*",
+        "rds:Describe*",
+        "ecs:Describe*", "ecs:List*",
+        "eks:Describe*", "eks:List*",
+        "lambda:Get*", "lambda:List*",
+        "cloudwatch:Describe*", "cloudwatch:Get*", "cloudwatch:List*",
+        "cloudtrail:Describe*", "cloudtrail:Get*", "cloudtrail:List*",
+        "iam:Get*", "iam:List*",
+        "ssm:Describe*", "ssm:Get*", "ssm:List*"
       ],
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:CalledViaFirst": "mcp.amazonaws.com"
+          "aws:CalledViaAWSMCP": "aws-mcp.amazonaws.com"
         }
       }
     }
@@ -127,19 +145,20 @@ aws iam put-role-policy \
 
 ### パターン 2: 全権限（Full Access）
 
-全 AWS サービスへの完全なアクセス。サンドボックスや個人アカウントのみで使用してください。
+MCP 経由で全 AWS サービスへ完全アクセス。サンドボックスや個人アカウントのみで使用してください。
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "FullAccessViaMCP",
       "Effect": "Allow",
       "Action": "*",
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:CalledViaFirst": "mcp.amazonaws.com"
+          "aws:CalledViaAWSMCP": "aws-mcp.amazonaws.com"
         }
       }
     }
@@ -148,48 +167,58 @@ aws iam put-role-policy \
 ```
 
 ```bash
-aws iam attach-role-policy \
+aws iam create-role \
   --role-name aws-mcp-gateway-full \
-  --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+aws iam put-role-policy \
+  --role-name aws-mcp-gateway-full \
+  --policy-name mcp-full \
+  --policy-document file://policy-full.json
 ```
 
 ---
 
 ### パターン 3: 削除禁止（No Delete）
 
-全操作を許可しつつ、削除・終了・削除系の操作を拒否します。リソースの作成・変更は許可しつつ誤削除を防ぎたいステージング環境に適しています。
+MCP 経由の全操作を許可しつつ、削除・終了系の操作を明示的に拒否します。Deny には MCP 条件を付けず、どの経路からも削除できない強い制約にします。
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "AllowAllViaMCP",
       "Effect": "Allow",
       "Action": "*",
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:CalledViaFirst": "mcp.amazonaws.com"
+          "aws:CalledViaAWSMCP": "aws-mcp.amazonaws.com"
         }
       }
     },
     {
+      "Sid": "DenyDestructiveActions",
       "Effect": "Deny",
       "Action": [
-        "*:Delete*",
-        "*:Terminate*",
-        "*:Remove*",
-        "*:Deregister*",
-        "*:Detach*",
-        "*:Destroy*",
-        "*:Purge*",
-        "s3:DeleteObject*",
-        "s3:DeleteBucket*",
-        "ec2:TerminateInstances",
-        "rds:DeleteDBInstance",
-        "rds:DeleteDBCluster",
+        "s3:DeleteBucket", "s3:DeleteObject", "s3:DeleteObjects",
+        "ec2:TerminateInstances", "ec2:DeleteVpc", "ec2:DeleteSubnet",
+        "ec2:DeleteSecurityGroup", "ec2:DeleteInternetGateway",
+        "rds:DeleteDBInstance", "rds:DeleteDBCluster", "rds:DeleteDBSnapshot",
         "dynamodb:DeleteTable",
-        "lambda:DeleteFunction"
+        "lambda:DeleteFunction",
+        "ecs:DeleteCluster", "ecs:DeleteService",
+        "eks:DeleteCluster", "eks:DeleteNodegroup",
+        "iam:DeleteRole", "iam:DeletePolicy", "iam:DeleteUser",
+        "cloudformation:DeleteStack"
       ],
       "Resource": "*"
     }
@@ -219,42 +248,35 @@ aws iam put-role-policy \
 
 ### パターン 4: 読み取り専用＋デバッグ（Read-Only + Debug）
 
-読み取り専用に加えて、ログのクエリ・トレース参照・Lambda invoke・SSM セッションなど、障害調査や運用に必要な操作を許可します。オンコールエンジニアや SRE 向けです。
+読み取り専用に加えて、ログクエリ・トレース参照・Lambda invoke・SSM セッションなど、障害調査・オンコール対応に必要な操作を許可します。
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "ReadOnlyPlusDebugViaMCP",
       "Effect": "Allow",
       "Action": [
-        "*:Describe*",
-        "*:Get*",
-        "*:List*",
-        "*:View*",
-        "*:Search*",
-        "*:Lookup*",
-        "*:BatchGet*",
-        "logs:FilterLogEvents",
-        "logs:GetLogEvents",
-        "logs:StartQuery",
-        "logs:StopQuery",
-        "logs:GetQueryResults",
-        "logs:DescribeLogGroups",
-        "logs:DescribeLogStreams",
-        "cloudtrail:LookupEvents",
-        "xray:GetTraceSummaries",
-        "xray:BatchGetTraces",
-        "xray:GetInsightSummaries",
+        "ec2:Describe*", "ec2:Get*",
+        "s3:Get*", "s3:List*",
+        "rds:Describe*",
+        "ecs:Describe*", "ecs:List*",
+        "eks:Describe*", "eks:List*",
+        "lambda:Get*", "lambda:List*",
         "lambda:InvokeFunction",
-        "ssm:StartSession",
-        "ssm:SendCommand",
+        "cloudwatch:Describe*", "cloudwatch:Get*", "cloudwatch:List*",
+        "logs:Describe*", "logs:Get*", "logs:FilterLogEvents",
+        "logs:StartQuery", "logs:StopQuery", "logs:GetQueryResults",
+        "cloudtrail:LookupEvents",
+        "xray:GetTraceSummaries", "xray:BatchGetTraces", "xray:GetInsightSummaries",
+        "ssm:StartSession", "ssm:SendCommand", "ssm:GetCommandInvocation",
         "ecs:ExecuteCommand"
       ],
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:CalledViaFirst": "mcp.amazonaws.com"
+          "aws:CalledViaAWSMCP": "aws-mcp.amazonaws.com"
         }
       }
     }
@@ -282,7 +304,28 @@ aws iam put-role-policy \
 
 ---
 
-詳細な IAM 条件キーの活用については [Understanding IAM for managed AWS MCP servers](https://aws.amazon.com/blogs/security/understanding-iam-for-managed-aws-mcp-servers/) を参照してください。
+### 全 MCP アクセスを禁止（SCP / 緊急ロックアウト）
+
+SCP（Service Control Policy）としてアカウント全体の MCP 経由操作を完全ブロックする際に使用します。
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyAllViaMCP",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "Bool": {
+          "aws:ViaAWSMCPService": "true"
+        }
+      }
+    }
+  ]
+}
+```
 
 ## クイックスタート
 
