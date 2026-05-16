@@ -341,11 +341,22 @@ func buildProxy(target *url.URL, transport http.RoundTripper, targetAWSRegion st
 			r.Out.Header.Del("Cookie")
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			slog.Info("upstream response",
-				"method", resp.Request.Method,
-				"path", resp.Request.URL.Path,
-				"status", resp.StatusCode,
-			)
+			// デバッグ: レスポンスボディを一時読み取りしてログ出力（call_aws 問題調査用）
+			body, err := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if err == nil {
+				resp.Body = io.NopCloser(bytes.NewReader(body))
+				bodyStr := string(body)
+				if len(bodyStr) > 500 {
+					bodyStr = bodyStr[:500] + "..."
+				}
+				slog.Info("upstream response",
+					"method", resp.Request.Method,
+					"path", resp.Request.URL.Path,
+					"status", resp.StatusCode,
+					"body", bodyStr,
+				)
+			}
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
