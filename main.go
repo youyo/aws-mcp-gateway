@@ -1,23 +1,29 @@
-// Spike: AWS MCP Server への SigV4 署名リバースプロキシ
-// 検証内容: httputil.ReverseProxy + SigV4 RoundTripper で
-// Streamable HTTP MCP プロトコルが素通りするかを確認する
+// aws-mcp-gateway: OIDC-authenticated reverse proxy for AWS MCP Server.
 //
-// 使い方:
-//   AWS_REGION=us-east-1 go run main.go
+// Architecture:
+//   MCP Client (Claude Code etc.)
+//     ↓ OAuth 2.1 (Bearer Token)
+//   idproxy (EntraID OIDC auth)
+//     ↓ upstream HTTP
+//   httputil.ReverseProxy + SigV4 RoundTripper
+//     ↓ Streamable HTTP + SigV4
+//   AWS MCP Server (managed)
 //
-// 別ターミナルで確認:
-//   curl -X POST http://localhost:8080/mcp \
-//     -H "Content-Type: application/json" \
-//     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+// AWS credentials are resolved automatically from the environment
+// (Lambda execution role, ECS task role, EC2 instance profile, etc.)
 package main
 
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -27,54 +33,50 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
+	idproxy "github.com/youyo/idproxy"
+	"github.com/youyo/idproxy/store"
 )
 
 const (
-	awsMCPEndpoint = "https://aws-mcp.us-east-1.api.aws/mcp"
-	awsService     = "aws-mcp"
-	listenAddr     = ":8080"
+	defaultAWSMCPEndpoint  = "https://aws-mcp.us-east-1.api.aws/mcp"
+	awsMCPService          = "aws-mcp"
+	defaultListenPort      = "8080"
+	defaultTargetAWSRegion = "ap-northeast-1"
+	defaultMCPRegion       = "us-east-1"
 )
 
-// sigV4RoundTripper は http.RoundTripper に SigV4 署名を付与する
+// sigV4RoundTripper signs outbound HTTP requests with AWS SigV4.
 type sigV4RoundTripper struct {
-	base    http.RoundTripper
-	signer  *v4.Signer
-	region  string
-	service string
-	getCreds func(ctx context.Context) (string, string, string, error)
+	base     http.RoundTripper
+	signer   *v4.Signer
+	region   string
+	service  string
+	getCreds func(ctx context.Context) (aws.Credentials, error)
 }
 
 func newSigV4RoundTripper(ctx context.Context, region, service string) (*sigV4RoundTripper, error) {
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
-		return nil, fmt.Errorf("AWS 設定の読み込み失敗: %w", err)
+		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
-
-	getCreds := func(ctx context.Context) (string, string, string, error) {
-		creds, err := cfg.Credentials.Retrieve(ctx)
-		if err != nil {
-			return "", "", "", err
-		}
-		return creds.AccessKeyID, creds.SecretAccessKey, creds.SessionToken, nil
-	}
-
 	return &sigV4RoundTripper{
-		base:     http.DefaultTransport,
-		signer:   v4.NewSigner(),
-		region:   region,
-		service:  service,
-		getCreds: getCreds,
+		base:    http.DefaultTransport,
+		signer:  v4.NewSigner(),
+		region:  region,
+		service: service,
+		getCreds: func(ctx context.Context) (aws.Credentials, error) {
+			return cfg.Credentials.Retrieve(ctx)
+		},
 	}, nil
 }
 
 func (t *sigV4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	// ボディを読み取ってハッシュを計算（SigV4 に必要）
 	var bodyBytes []byte
 	if req.Body != nil {
 		var err error
 		bodyBytes, err = io.ReadAll(req.Body)
 		if err != nil {
-			return nil, fmt.Errorf("リクエストボディの読み取り失敗: %w", err)
+			return nil, fmt.Errorf("failed to read request body: %w", err)
 		}
 		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
@@ -82,78 +84,152 @@ func (t *sigV4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	hash := sha256.Sum256(bodyBytes)
 	payloadHash := fmt.Sprintf("%x", hash)
 
-	// クレデンシャルを取得
-	accessKey, secretKey, sessionToken, err := t.getCreds(req.Context())
+	creds, err := t.getCreds(req.Context())
 	if err != nil {
-		return nil, fmt.Errorf("AWS クレデンシャルの取得失敗: %w", err)
+		return nil, fmt.Errorf("failed to retrieve AWS credentials: %w", err)
 	}
 
-	// SigV4 署名
-	creds := aws.Credentials{
-		AccessKeyID:     accessKey,
-		SecretAccessKey: secretKey,
-		SessionToken:    sessionToken,
-	}
-	err = t.signer.SignHTTP(req.Context(), creds, req, payloadHash, t.service, t.region, time.Now())
-	if err != nil {
-		return nil, fmt.Errorf("SigV4 署名失敗: %w", err)
+	if err := t.signer.SignHTTP(req.Context(), creds, req, payloadHash, t.service, t.region, time.Now()); err != nil {
+		return nil, fmt.Errorf("SigV4 signing failed: %w", err)
 	}
 
 	return t.base.RoundTrip(req)
 }
 
-func buildProxy(target *url.URL, transport http.RoundTripper, metadataRegion string) *httputil.ReverseProxy {
+func buildProxy(target *url.URL, transport http.RoundTripper, targetAWSRegion string) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Transport: transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 			r.Out.Host = target.Host
-			r.Out.URL.Path = target.Path // パスを固定（二重にならないよう）
-			r.Out.Header.Set("x-amz-mcp-metadata-aws_region", metadataRegion)
+			r.Out.URL.Path = target.Path
+			r.Out.Header.Set("x-amz-mcp-metadata-aws_region", targetAWSRegion)
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			log.Printf("← %s %s %d", resp.Request.Method, resp.Request.URL.Path, resp.StatusCode)
+			slog.Info("upstream response",
+				"method", resp.Request.Method,
+				"path", resp.Request.URL.Path,
+				"status", resp.StatusCode,
+			)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("プロキシエラー: %v", err)
+			slog.Error("proxy error", "error", err.Error())
 			http.Error(w, err.Error(), http.StatusBadGateway)
 		},
 	}
 }
 
-func main() {
-	region := os.Getenv("AWS_REGION")
-	if region == "" {
-		region = "us-east-1"
+func mustEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		slog.Error("required environment variable not set", "key", key)
+		os.Exit(1)
 	}
+	return v
+}
 
-	metadataRegion := os.Getenv("TARGET_AWS_REGION")
-	if metadataRegion == "" {
-		metadataRegion = "ap-northeast-1"
+func getEnvOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
+	return def
+}
+
+func main() {
+	// JSON structured logging
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
 	ctx := context.Background()
 
-	// SigV4 RoundTripper を作成
-	transport, err := newSigV4RoundTripper(ctx, region, awsService)
-	if err != nil {
-		log.Fatalf("RoundTripper の作成失敗: %v", err)
+	// Configuration
+	mcpEndpoint := getEnvOrDefault("AWS_MCP_ENDPOINT", defaultAWSMCPEndpoint)
+	mcpRegion := getEnvOrDefault("AWS_MCP_REGION", defaultMCPRegion)
+	targetAWSRegion := getEnvOrDefault("TARGET_AWS_REGION", defaultTargetAWSRegion)
+	port := getEnvOrDefault("PORT", defaultListenPort)
+	externalURL := mustEnv("EXTERNAL_URL")
+	oidcIssuer := mustEnv("OIDC_ISSUER")
+	oidcClientID := mustEnv("OIDC_CLIENT_ID")
+	oidcClientSecret := os.Getenv("OIDC_CLIENT_SECRET")
+
+	cookieSecretHex := os.Getenv("COOKIE_SECRET")
+	var cookieSecret []byte
+	if cookieSecretHex != "" {
+		var err error
+		cookieSecret, err = hex.DecodeString(cookieSecretHex)
+		if err != nil {
+			slog.Error("invalid COOKIE_SECRET: must be hex-encoded", "error", err.Error())
+			os.Exit(1)
+		}
+	} else {
+		cookieSecret = make([]byte, 32)
+		if _, err := rand.Read(cookieSecret); err != nil {
+			slog.Error("failed to generate cookie secret", "error", err.Error())
+			os.Exit(1)
+		}
+		slog.Warn("COOKIE_SECRET not set, using random secret (sessions will be lost on restart)")
 	}
 
-	// AWS MCP Server のエンドポイントをパース
-	target, err := url.Parse(awsMCPEndpoint)
+	// SigV4 transport
+	transport, err := newSigV4RoundTripper(ctx, mcpRegion, awsMCPService)
 	if err != nil {
-		log.Fatalf("エンドポイントのパース失敗: %v", err)
+		slog.Error("failed to create SigV4 round tripper", "error", err.Error())
+		os.Exit(1)
 	}
 
-	proxy := buildProxy(target, transport, metadataRegion)
+	// Reverse proxy to AWS MCP Server
+	target, err := url.Parse(mcpEndpoint)
+	if err != nil {
+		slog.Error("invalid AWS MCP endpoint", "endpoint", mcpEndpoint, "error", err.Error())
+		os.Exit(1)
+	}
+	proxy := buildProxy(target, transport, targetAWSRegion)
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("→ %s %s", r.Method, r.URL.Path)
-		proxy.ServeHTTP(w, r)
-	})
+	// ECDSA signing key for OAuth 2.1 JWT (ephemeral; use a persisted key in production)
+	signingKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		slog.Error("failed to generate ECDSA signing key", "error", err.Error())
+		os.Exit(1)
+	}
 
-	log.Printf("起動: %s → %s (target region: %s)", listenAddr, awsMCPEndpoint, metadataRegion)
-	log.Fatal(http.ListenAndServe(listenAddr, nil))
+	// idproxy: OIDC auth + OAuth 2.1 Authorization Server
+	provider := idproxy.OIDCProvider{
+		Issuer:   oidcIssuer,
+		ClientID: oidcClientID,
+	}
+	if oidcClientSecret != "" {
+		provider.ClientSecret = oidcClientSecret
+	}
+
+	authCfg := idproxy.Config{
+		Providers:    []idproxy.OIDCProvider{provider},
+		ExternalURL:  externalURL,
+		CookieSecret: cookieSecret,
+		Store:        store.NewMemoryStore(),
+		OAuth: &idproxy.OAuthConfig{
+			SigningKey: signingKey,
+		},
+	}
+
+	auth, err := idproxy.New(ctx, authCfg)
+	if err != nil {
+		slog.Error("failed to initialize idproxy", "error", err.Error())
+		os.Exit(1)
+	}
+
+	http.Handle("/", auth.Wrap(proxy))
+
+	slog.Info("aws-mcp-gateway started",
+		"addr", ":"+port,
+		"endpoint", mcpEndpoint,
+		"mcp_region", mcpRegion,
+		"target_aws_region", targetAWSRegion,
+		"external_url", externalURL,
+		"oidc_issuer", oidcIssuer,
+	)
+
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		slog.Error("server error", "error", err.Error())
+		os.Exit(1)
+	}
 }

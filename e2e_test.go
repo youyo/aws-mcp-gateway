@@ -137,11 +137,11 @@ func TestRealAWSMCPEndpointError(t *testing.T) {
 	t.Setenv("AWS_REGION", "us-east-1")
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 
-	transport, err := newSigV4RoundTripper(context.Background(), "us-east-1", awsService)
+	transport, err := newSigV4RoundTripper(context.Background(), "us-east-1", awsMCPService)
 	if err != nil {
 		t.Fatalf("RoundTripper 作成失敗: %v", err)
 	}
-	target, _ := url.Parse(awsMCPEndpoint)
+	target, _ := url.Parse(defaultAWSMCPEndpoint)
 	proxy := buildProxy(target, transport, "ap-northeast-1")
 	srv := httptest.NewServer(proxy)
 	defer srv.Close()
