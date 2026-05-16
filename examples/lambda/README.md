@@ -277,6 +277,10 @@ aws ssm put-parameter --region $REGION --type String --name /${INSTANCE_NAME}/AS
 ### Step 1 — Initial deploy (without Function URL)
 
 ```bash
+# Set INSTANCE_NAME first — used throughout all subsequent commands
+export INSTANCE_NAME=aws-mcp-gateway-prod
+export AWS_REGION=ap-northeast-1
+
 VERSION=0.3.0  # update to latest release
 curl -fsSL -o aws-mcp-gateway.tar.gz \
   "https://github.com/youyo/aws-mcp-gateway/releases/download/v${VERSION}/aws-mcp-gateway_${VERSION}_Linux_arm64.tar.gz"
@@ -284,10 +288,17 @@ tar xzf aws-mcp-gateway.tar.gz aws-mcp-gateway
 mv aws-mcp-gateway bootstrap
 zip -j function.zip bootstrap
 
+# Seed EXTERNAL_URL with a placeholder (required before first deploy)
+# lambroll resolves all SSM values at deploy time — the parameter must exist.
+# Update to the real Function URL in Step 2.
+aws ssm put-parameter \
+  --region $AWS_REGION \
+  --name /${INSTANCE_NAME}/EXTERNAL_URL \
+  --value "https://placeholder.invalid" \
+  --type SecureString
+
 # Deploy function only (no Function URL yet)
-INSTANCE_NAME=aws-mcp-gateway-prod \
 ROLE_ARN=arn:aws:iam::<ACCOUNT_ID>:role/${INSTANCE_NAME}-lambda-role \
-AWS_REGION=ap-northeast-1 \
 lambroll deploy \
   --function examples/lambda/function.json \
   --src function.zip
@@ -296,19 +307,23 @@ lambroll deploy \
 ### Step 2 — Set EXTERNAL_URL and create Function URL
 
 ```bash
+# INSTANCE_NAME and AWS_REGION must be set (from Step 1, or re-export here)
+export INSTANCE_NAME=aws-mcp-gateway-prod
+export AWS_REGION=ap-northeast-1
+
 # Get the Function URL
 FUNCTION_URL=$(aws lambda get-function-url-config \
-  --function-name aws-mcp-gateway \
+  --function-name "${INSTANCE_NAME}" \
   --query 'FunctionUrl' --output text 2>/dev/null || echo "")
 
 if [ -z "$FUNCTION_URL" ]; then
   # Create Function URL on first run
   aws lambda create-function-url-config \
-    --function-name aws-mcp-gateway \
+    --function-name "${INSTANCE_NAME}" \
     --auth-type NONE \
     --invoke-mode RESPONSE_STREAM
   FUNCTION_URL=$(aws lambda get-function-url-config \
-    --function-name aws-mcp-gateway \
+    --function-name "${INSTANCE_NAME}" \
     --query 'FunctionUrl' --output text)
 fi
 
@@ -322,7 +337,6 @@ aws ssm put-parameter \
 
 # Re-deploy with Function URL and updated EXTERNAL_URL
 ROLE_ARN=arn:aws:iam::<ACCOUNT_ID>:role/${INSTANCE_NAME}-lambda-role \
-AWS_REGION=ap-northeast-1 \
 lambroll deploy \
   --function examples/lambda/function.json \
   --function-url examples/lambda/function_url.json \
@@ -352,8 +366,8 @@ Copy `.github/workflows/deploy.yml` to your repository and set:
 ### Single account
 
 ```bash
-# Get Function URL
-aws lambda get-function-url-config --function-name aws-mcp-gateway \
+# Get Function URL (replace aws-mcp-gateway-prod with your INSTANCE_NAME)
+aws lambda get-function-url-config --function-name aws-mcp-gateway-prod \
   --query 'FunctionUrl' --output text
 ```
 
