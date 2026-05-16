@@ -102,6 +102,25 @@ func (t *sigV4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	return t.base.RoundTrip(req)
 }
 
+func buildProxy(target *url.URL, transport http.RoundTripper, metadataRegion string) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Transport: transport,
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(target)
+			r.Out.Host = target.Host
+			r.Out.Header.Set("x-amz-mcp-metadata-aws_region", metadataRegion)
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			log.Printf("← %s %s %d", resp.Request.Method, resp.Request.URL.Path, resp.StatusCode)
+			return nil
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("プロキシエラー: %v", err)
+			http.Error(w, err.Error(), http.StatusBadGateway)
+		},
+	}
+}
+
 func main() {
 	region := os.Getenv("AWS_REGION")
 	if region == "" {
@@ -127,24 +146,7 @@ func main() {
 		log.Fatalf("エンドポイントのパース失敗: %v", err)
 	}
 
-	// リバースプロキシを構築
-	proxy := &httputil.ReverseProxy{
-		Transport: transport,
-		Rewrite: func(r *httputil.ProxyRequest) {
-			r.SetURL(target)
-			r.Out.Host = target.Host
-			// TARGET_AWS_REGION を metadata として注入
-			r.Out.Header.Set("x-amz-mcp-metadata-aws_region", metadataRegion)
-		},
-		ModifyResponse: func(resp *http.Response) error {
-			log.Printf("← %s %s %d", resp.Request.Method, resp.Request.URL.Path, resp.StatusCode)
-			return nil
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("プロキシエラー: %v", err)
-			http.Error(w, err.Error(), http.StatusBadGateway)
-		},
-	}
+	proxy := buildProxy(target, transport, metadataRegion)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("→ %s %s", r.Method, r.URL.Path)
