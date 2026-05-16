@@ -90,54 +90,9 @@ Use `aws:CalledViaAWSMCP` to restrict permissions to a specific MCP server. Use 
 
 ### Pattern 1: Read-Only
 
-Allow-list of read operations across major services. Safer than deny-list because unlisted actions are implicitly denied.
+Attach the AWS-managed `ReadOnlyAccess` policy. Covers all AWS services and is automatically updated as new services are added.
 
-> **Coverage note:** This list covers common services. For complete coverage of all AWS services, attach `arn:aws:iam::aws:policy/ReadOnlyAccess` instead (AWS-managed, automatically updated, but cannot carry the `aws:CalledViaAWSMCP` condition).
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "ReadOnlyViaMCP",
-      "Effect": "Allow",
-      "Action": [
-        "ec2:Describe*", "ec2:Get*",
-        "s3:Get*", "s3:List*",
-        "rds:Describe*",
-        "ecs:Describe*", "ecs:List*",
-        "eks:Describe*", "eks:List*",
-        "lambda:Get*", "lambda:List*",
-        "cloudwatch:Describe*", "cloudwatch:Get*", "cloudwatch:List*",
-        "cloudtrail:Describe*", "cloudtrail:Get*", "cloudtrail:List*",
-        "iam:Get*", "iam:List*",
-        "ssm:Describe*", "ssm:Get*", "ssm:List*",
-        "dynamodb:Describe*", "dynamodb:List*", "dynamodb:Get*",
-        "kms:Describe*", "kms:Get*", "kms:List*",
-        "secretsmanager:Describe*", "secretsmanager:List*", "secretsmanager:GetResourcePolicy",
-        "logs:Describe*", "logs:Get*", "logs:List*", "logs:FilterLogEvents",
-        "sns:Get*", "sns:List*",
-        "sqs:Get*", "sqs:List*",
-        "ecr:Describe*", "ecr:Get*", "ecr:List*", "ecr:BatchGet*",
-        "elasticloadbalancing:Describe*",
-        "autoscaling:Describe*",
-        "cloudformation:Describe*", "cloudformation:Get*", "cloudformation:List*",
-        "route53:Get*", "route53:List*",
-        "events:Describe*", "events:List*",
-        "stepfunctions:Describe*", "stepfunctions:Get*", "stepfunctions:List*",
-        "apigateway:GET",
-        "cloudfront:Describe*", "cloudfront:Get*", "cloudfront:List*"
-      ],
-      "Resource": "*",
-      "Condition": {
-        "StringEquals": {
-          "aws:CalledViaAWSMCP": "aws-mcp.amazonaws.com"
-        }
-      }
-    }
-  ]
-}
-```
+> **Note:** AWS managed policies cannot carry IAM conditions, so `aws:CalledViaAWSMCP` cannot be applied. Since this role is dedicated to the gateway, the risk is limited — but be aware that any process running with this role can read AWS resources directly, not just via MCP.
 
 ```bash
 # Create role (example: for ECS task)
@@ -152,10 +107,9 @@ aws iam create-role \
     }]
   }'
 
-aws iam put-role-policy \
+aws iam attach-role-policy \
   --role-name aws-mcp-gateway-readonly \
-  --policy-name mcp-readonly \
-  --policy-document file://policy-readonly.json
+  --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess
 ```
 
 ---
@@ -278,7 +232,9 @@ aws iam put-role-policy \
 
 ### Pattern 4: Operational Investigation
 
-> ⚠️ **This pattern grants remote execution permissions**, not read-only.
+`ReadOnlyAccess` plus an inline policy that grants execution permissions needed for incident investigation.
+
+> ⚠️ **The inline policy grants remote execution permissions**, not read-only.
 > - `ssm:SendCommand` / `ecs:ExecuteCommand` — equivalent to remote shell access on instances and containers. Can read secrets, credentials, and filesystem data.
 > - `lambda:InvokeFunction` — executes business logic with potential side effects.
 >
@@ -287,30 +243,25 @@ aws iam put-role-policy \
 > - ECS Exec: enable `execute-command` logging in task definition
 > - Lambda: enable function-level CloudWatch Logs
 
-Read access plus log querying, distributed tracing, Lambda invocation, and remote shell for incident investigation.
-
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "ReadOnlyPlusDebugViaMCP",
+      "Sid": "OperationalAccessViaMCP",
       "Effect": "Allow",
       "Action": [
-        "ec2:Describe*", "ec2:Get*",
-        "s3:Get*", "s3:List*",
-        "rds:Describe*",
-        "ecs:Describe*", "ecs:List*",
-        "eks:Describe*", "eks:List*",
-        "lambda:Get*", "lambda:List*",
         "lambda:InvokeFunction",
-        "cloudwatch:Describe*", "cloudwatch:Get*", "cloudwatch:List*",
-        "logs:Describe*", "logs:Get*", "logs:FilterLogEvents",
-        "logs:StartQuery", "logs:StopQuery", "logs:GetQueryResults",
-        "cloudtrail:LookupEvents",
-        "xray:GetTraceSummaries", "xray:BatchGetTraces", "xray:GetInsightSummaries",
-        "ssm:StartSession", "ssm:SendCommand", "ssm:GetCommandInvocation",
-        "ecs:ExecuteCommand"
+        "ssm:SendCommand",
+        "ssm:GetCommandInvocation",
+        "ecs:ExecuteCommand",
+        "logs:StartQuery",
+        "logs:StopQuery",
+        "logs:GetQueryResults",
+        "xray:GetTraceSummaries",
+        "xray:BatchGetTraces",
+        "xray:GetInsightSummaries",
+        "cloudtrail:LookupEvents"
       ],
       "Resource": "*",
       "Condition": {
@@ -335,10 +286,16 @@ aws iam create-role \
     }]
   }'
 
+# ReadOnlyAccess covers all read operations
+aws iam attach-role-policy \
+  --role-name aws-mcp-gateway-debug \
+  --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess
+
+# Inline policy adds execution permissions (with MCP condition)
 aws iam put-role-policy \
   --role-name aws-mcp-gateway-debug \
-  --policy-name mcp-debug \
-  --policy-document file://policy-debug.json
+  --policy-name mcp-debug-exec \
+  --policy-document file://policy-debug-exec.json
 ```
 
 ---
