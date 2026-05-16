@@ -117,19 +117,23 @@ func (t *sigV4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 }
 
 // sigV4HTTPTransport は SigV4 署名リクエスト用の共有 HTTP Transport。
-// ResponseHeaderTimeout を設定し、hung upstream による goroutine leak を防ぐ。
+// http.DefaultTransport を clone して HTTP_PROXY/HTTPS_PROXY 環境変数や
+// HTTP/2 サポートを保持しつつ、本番運用向けにタイムアウトと接続プールを設定する。
+// ResponseHeaderTimeout により hung upstream による goroutine leak を防ぐ。
 // SSE / Streamable HTTP は ResponseHeader 受信後にストリームが始まるため両立可能。
-var sigV4HTTPTransport = &http.Transport{
-	DialContext: (&net.Dialer{
+var sigV4HTTPTransport = func() *http.Transport {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = (&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
-	}).DialContext,
-	MaxIdleConns:          100,
-	MaxIdleConnsPerHost:   20,
-	IdleConnTimeout:       90 * time.Second,
-	TLSHandshakeTimeout:   10 * time.Second,
-	ResponseHeaderTimeout: 30 * time.Second,
-}
+	}).DialContext
+	tr.MaxIdleConns = 100
+	tr.MaxIdleConnsPerHost = 20
+	tr.IdleConnTimeout = 90 * time.Second
+	tr.TLSHandshakeTimeout = 10 * time.Second
+	tr.ResponseHeaderTimeout = 30 * time.Second
+	return tr
+}()
 
 // federatedCredsCache はユーザーごとの CredentialsCache をキャッシュする。
 // キー: "sub::tokenFingerprint"（8桁の sha256 hex）
