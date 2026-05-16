@@ -46,7 +46,9 @@ AWS credentials are resolved automatically from the environment (Lambda executio
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `OIDC_CLIENT_SECRET` | OAuth Client Secret | none |
+| `OIDC_CLIENT_SECRET` | OAuth Client Secret | **required** |
+| `ALLOWED_DOMAINS` | Comma-separated list of allowed email domains (e.g. `example.com,corp.example.com`). If both `ALLOWED_DOMAINS` and `ALLOWED_EMAILS` are unset, **any user in the OIDC tenant can authenticate** | none (warning logged) |
+| `ALLOWED_EMAILS` | Comma-separated list of allowed email addresses. Combined with `ALLOWED_DOMAINS` (OR logic) | none |
 | `COOKIE_SECRET` | Cookie encryption key (hex-encoded, 32+ bytes) | Random (sessions lost on restart) |
 | `AWS_MCP_ENDPOINT` | AWS MCP Server endpoint URL (overrides `AWS_MCP_REGION`) | derived from `AWS_MCP_REGION` |
 | `AWS_MCP_REGION` | Region of the AWS MCP Server endpoint | `us-east-1` |

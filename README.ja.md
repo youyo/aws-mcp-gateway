@@ -46,7 +46,9 @@ AWS 認証情報は環境から自動解決されます（Lambda 実行ロール
 
 | 変数 | 説明 | デフォルト |
 |------|------|-----------|
-| `OIDC_CLIENT_SECRET` | OAuth クライアントシークレット | なし |
+| `OIDC_CLIENT_SECRET` | OAuth クライアントシークレット | **必須** |
+| `ALLOWED_DOMAINS` | 許可するメールドメインのカンマ区切りリスト（例: `example.com,corp.example.com`）。`ALLOWED_DOMAINS` と `ALLOWED_EMAILS` が両方未設定の場合、**OIDC テナントの任意ユーザーが認証可能**（警告ログを出力） | なし |
+| `ALLOWED_EMAILS` | 許可するメールアドレスのカンマ区切りリスト。`ALLOWED_DOMAINS` と OR 条件で評価 | なし |
 | `COOKIE_SECRET` | Cookie 暗号化キー（hex 形式、32バイト以上） | ランダム生成（再起動でセッション消失） |
 | `AWS_MCP_ENDPOINT` | AWS MCP Server エンドポイント URL（`AWS_MCP_REGION` より優先） | `AWS_MCP_REGION` から自動生成 |
 | `AWS_MCP_REGION` | AWS MCP Server エンドポイントのリージョン | `us-east-1` |
