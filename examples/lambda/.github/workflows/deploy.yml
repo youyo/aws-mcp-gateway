@@ -1,0 +1,60 @@
+name: deploy
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    env:
+      LAMBDA_ARCH: arm64
+      AWS_REGION: ap-northeast-1
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Load VERSION from git tag
+        id: ver
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test -n "$version" || { echo "Could not determine version from ref: $GITHUB_REF_NAME"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Detected VERSION=$version"
+
+      - uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6.1.1
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: fujiwara/lambroll@aacd326598a771211cd03475e0ac9b846b786259 # v1.4.3
+        with:
+          version: v1.4.3
+
+      - name: Download aws-mcp-gateway binary
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          ARCHIVE="aws-mcp-gateway_${VERSION}_Linux_${LAMBDA_ARCH}.tar.gz"
+          curl -fsSL -o "${ARCHIVE}" \
+            "https://github.com/youyo/aws-mcp-gateway/releases/download/v${VERSION}/${ARCHIVE}"
+          tar xzf "${ARCHIVE}" aws-mcp-gateway
+          mv aws-mcp-gateway bootstrap
+          chmod +x bootstrap
+          file bootstrap
+
+      - name: Package function.zip
+        run: zip -j function.zip bootstrap
+
+      - name: Lambroll deploy
+        env:
+          ROLE_ARN: ${{ vars.LAMBDA_ROLE_ARN }}
+        run: lambroll deploy --function examples/lambda/function.json --function-url examples/lambda/function_url.json

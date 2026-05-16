@@ -1,0 +1,24 @@
+{
+  "FunctionName": "aws-mcp-gateway",
+  "Description": "OIDC-authenticated reverse proxy for AWS MCP Server",
+  "Runtime": "provided.al2023",
+  "Handler": "bootstrap",
+  "Architectures": ["arm64"],
+  "MemorySize": 256,
+  "Timeout": 900,
+  "Role": "{{ must_env `ROLE_ARN` }}",
+  "Layers": [
+    "arn:aws:lambda:{{ must_env `AWS_REGION` }}:753240598075:layer:LambdaAdapterLayerArm64:27"
+  ],
+  "Environment": {
+    "Variables": {
+      "EXTERNAL_URL":        "{{ ssm `/aws-mcp-gateway/EXTERNAL_URL` }}",
+      "OIDC_ISSUER":         "{{ ssm `/aws-mcp-gateway/OIDC_ISSUER` }}",
+      "OIDC_CLIENT_ID":      "{{ ssm `/aws-mcp-gateway/OIDC_CLIENT_ID` }}",
+      "OIDC_CLIENT_SECRET":  "{{ ssm `/aws-mcp-gateway/OIDC_CLIENT_SECRET` }}",
+      "COOKIE_SECRET":       "{{ ssm `/aws-mcp-gateway/COOKIE_SECRET` }}",
+      "AWS_MCP_REGION":      "{{ ssm `/aws-mcp-gateway/AWS_MCP_REGION` }}",
+      "TARGET_AWS_REGION":   "{{ ssm `/aws-mcp-gateway/TARGET_AWS_REGION` }}"
+    }
+  }
+}

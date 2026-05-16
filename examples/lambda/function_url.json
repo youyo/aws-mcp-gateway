@@ -1,0 +1,10 @@
+{
+  "Config": {
+    "AuthType": "NONE",
+    "Cors": {
+      "AllowOrigins": ["*"],
+      "AllowMethods": ["GET", "POST", "OPTIONS"],
+      "AllowHeaders": ["Authorization", "Content-Type", "Accept"]
+    }
+  }
+}
