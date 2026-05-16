@@ -1,0 +1,3 @@
+aws-mcp-gateway
+dist/
+*.test
