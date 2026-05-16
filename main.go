@@ -114,7 +114,8 @@ func newStore(ctx context.Context) (idproxy.Store, error) {
 
 func buildProxy(target *url.URL, transport http.RoundTripper, targetAWSRegion string) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
-		Transport: transport,
+		Transport:     transport,
+		FlushInterval: -1, // flush immediately for SSE / Streamable HTTP
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 			r.Out.Host = target.Host
