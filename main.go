@@ -33,6 +33,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	idproxy "github.com/youyo/idproxy"
 	"github.com/youyo/idproxy/store"
 )
@@ -59,6 +61,19 @@ func newSigV4RoundTripper(ctx context.Context, region, service string) (*sigV4Ro
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
+
+	// If ASSUME_ROLE_ARN is set, assume the specified role before signing requests.
+	// Useful when the runtime role (Lambda execution role, etc.) needs to access
+	// a different AWS account or a role with narrower permissions.
+	if assumeRoleARN := os.Getenv("ASSUME_ROLE_ARN"); assumeRoleARN != "" {
+		stsClient := sts.NewFromConfig(cfg)
+		provider := stscreds.NewAssumeRoleProvider(stsClient, assumeRoleARN, func(o *stscreds.AssumeRoleOptions) {
+			o.RoleSessionName = "aws-mcp-gateway"
+		})
+		cfg.Credentials = aws.NewCredentialsCache(provider)
+		slog.Info("using assumed role", "role_arn", assumeRoleARN)
+	}
+
 	return &sigV4RoundTripper{
 		base:    http.DefaultTransport,
 		signer:  v4.NewSigner(),

@@ -143,6 +143,56 @@ aws iam put-role-policy \
   }'
 ```
 
+## AssumeRole Setup (optional — for cross-account access)
+
+When `ASSUME_ROLE_ARN` is set, the Lambda execution role assumes the specified target role before signing MCP requests.
+
+> ⚠️ **CloudTrail audit note:** All users share the session name `aws-mcp-gateway` in CloudTrail. You cannot isolate per-user actions in the target account from CloudTrail alone — correlate with gateway access logs by timestamp instead.
+
+### 1. Grant `sts:AssumeRole` on the Lambda execution role
+
+```bash
+aws iam put-role-policy \
+  --role-name aws-mcp-gateway-lambda-role \
+  --policy-name assume-mcp-target \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::<TARGET_ACCOUNT_ID>:role/<TARGET_ROLE_NAME>"
+    }]
+  }'
+```
+
+### 2. Add a trust policy to the target role
+
+In the **target AWS account**, allow the Lambda execution role to assume the target role:
+
+```bash
+aws iam update-assume-role-policy \
+  --role-name <TARGET_ROLE_NAME> \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::<LAMBDA_ACCOUNT_ID>:role/aws-mcp-gateway-lambda-role"
+      },
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+```
+
+### 3. Set the SSM parameter
+
+```bash
+aws ssm put-parameter --region $REGION --type String \
+  --name /aws-mcp-gateway/ASSUME_ROLE_ARN \
+  --value "arn:aws:iam::<TARGET_ACCOUNT_ID>:role/<TARGET_ROLE_NAME>" \
+  --overwrite
+```
+
 ## DynamoDB Setup (required for Lambda)
 
 Lambda cold starts reset in-memory state. DynamoDB provides persistent sessions across invocations.
@@ -199,6 +249,12 @@ aws ssm put-parameter --region $REGION --type String --name /aws-mcp-gateway/AWS
 
 aws ssm put-parameter --region $REGION --type String --name /aws-mcp-gateway/TARGET_AWS_REGION \
   --value "ap-northeast-1"
+
+# ASSUME_ROLE_ARN (optional — set to empty string if not using AssumeRole)
+# lambroll does not support optional SSM parameters; the parameter must always exist.
+# Set to the target role ARN when using cross-account access, or empty string otherwise.
+aws ssm put-parameter --region $REGION --type String --name /aws-mcp-gateway/ASSUME_ROLE_ARN \
+  --value ""
 ```
 
 ## Deploy

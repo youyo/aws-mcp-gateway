@@ -20,6 +20,7 @@
       "AWS_MCP_REGION":      "{{ ssm `/aws-mcp-gateway/AWS_MCP_REGION` }}",
       "TARGET_AWS_REGION":   "{{ ssm `/aws-mcp-gateway/TARGET_AWS_REGION` }}",
       "AWS_LWA_INVOKE_MODE": "response_stream",
+      "ASSUME_ROLE_ARN":     "{{ ssm `/aws-mcp-gateway/ASSUME_ROLE_ARN` }}",
       "STORE_BACKEND":       "dynamodb",
       "DYNAMODB_TABLE":      "{{ ssm `/aws-mcp-gateway/DYNAMODB_TABLE` }}",
       "DYNAMODB_REGION":     "{{ ssm `/aws-mcp-gateway/DYNAMODB_REGION` }}"
