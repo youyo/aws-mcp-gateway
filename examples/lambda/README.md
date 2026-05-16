@@ -69,6 +69,44 @@ aws iam create-role \
   }'
 ```
 
+## DynamoDB Setup (required for Lambda)
+
+Lambda restarts on cold starts, so the default in-memory session store loses all sessions. Use DynamoDB for persistent sessions.
+
+```bash
+REGION=ap-northeast-1
+
+# Create DynamoDB table
+aws dynamodb create-table \
+  --region $REGION \
+  --table-name aws-mcp-gateway \
+  --attribute-definitions AttributeName=pk,AttributeType=S \
+  --key-schema AttributeName=pk,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST
+
+# Enable TTL (required for automatic session expiry)
+aws dynamodb update-time-to-live \
+  --region $REGION \
+  --table-name aws-mcp-gateway \
+  --time-to-live-specification "Enabled=true,AttributeName=ttl"
+```
+
+Add DynamoDB permissions to the Lambda execution role:
+
+```bash
+aws iam put-role-policy \
+  --role-name aws-mcp-gateway-lambda-role \
+  --policy-name dynamodb-session-store \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"],
+      "Resource": "arn:aws:dynamodb:ap-northeast-1:*:table/aws-mcp-gateway"
+    }]
+  }'
+```
+
 ## SSM Parameter Store Setup
 
 ```bash
@@ -95,6 +133,13 @@ aws ssm put-parameter --region $REGION --type String --name /aws-mcp-gateway/AWS
   --value "us-east-1"
 
 aws ssm put-parameter --region $REGION --type String --name /aws-mcp-gateway/TARGET_AWS_REGION \
+  --value "ap-northeast-1"
+
+# DynamoDB session store (required for Lambda)
+aws ssm put-parameter --region $REGION --type String --name /aws-mcp-gateway/DYNAMODB_TABLE \
+  --value "aws-mcp-gateway"
+
+aws ssm put-parameter --region $REGION --type String --name /aws-mcp-gateway/DYNAMODB_REGION \
   --value "ap-northeast-1"
 ```
 

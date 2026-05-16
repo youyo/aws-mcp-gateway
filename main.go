@@ -96,6 +96,22 @@ func (t *sigV4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	return t.base.RoundTrip(req)
 }
 
+// newStore initializes the session store based on the STORE_BACKEND environment variable.
+// Supported backends: "memory" (default), "dynamodb".
+func newStore(ctx context.Context) (idproxy.Store, error) {
+	backend := getEnvOrDefault("STORE_BACKEND", "memory")
+	switch backend {
+	case "dynamodb":
+		table := mustEnv("DYNAMODB_TABLE")
+		region := getEnvOrDefault("DYNAMODB_REGION", "ap-northeast-1")
+		slog.Info("using DynamoDB session store", "table", table, "region", region)
+		return store.NewDynamoDBStore(table, region)
+	default:
+		slog.Warn("using in-memory session store — sessions will be lost on restart (not suitable for Lambda)")
+		return store.NewMemoryStore(), nil
+	}
+}
+
 func buildProxy(target *url.URL, transport http.RoundTripper, targetAWSRegion string) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Transport: transport,
@@ -206,11 +222,20 @@ func main() {
 		provider.ClientSecret = oidcClientSecret
 	}
 
+	// Select session store backend via STORE_BACKEND env var.
+	// "dynamodb" requires DYNAMODB_TABLE and DYNAMODB_REGION.
+	// Default: "memory" (sessions lost on process restart — not suitable for Lambda).
+	sessionStore, err := newStore(ctx)
+	if err != nil {
+		slog.Error("failed to initialize session store", "error", err.Error())
+		os.Exit(1)
+	}
+
 	authCfg := idproxy.Config{
 		Providers:    []idproxy.OIDCProvider{provider},
 		ExternalURL:  externalURL,
 		CookieSecret: cookieSecret,
-		Store:        store.NewMemoryStore(),
+		Store:        sessionStore,
 		OAuth: &idproxy.OAuthConfig{
 			SigningKey: signingKey,
 		},

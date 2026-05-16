@@ -18,7 +18,10 @@
       "OIDC_CLIENT_SECRET":  "{{ ssm `/aws-mcp-gateway/OIDC_CLIENT_SECRET` }}",
       "COOKIE_SECRET":       "{{ ssm `/aws-mcp-gateway/COOKIE_SECRET` }}",
       "AWS_MCP_REGION":      "{{ ssm `/aws-mcp-gateway/AWS_MCP_REGION` }}",
-      "TARGET_AWS_REGION":   "{{ ssm `/aws-mcp-gateway/TARGET_AWS_REGION` }}"
+      "TARGET_AWS_REGION":   "{{ ssm `/aws-mcp-gateway/TARGET_AWS_REGION` }}",
+      "STORE_BACKEND":       "dynamodb",
+      "DYNAMODB_TABLE":      "{{ ssm `/aws-mcp-gateway/DYNAMODB_TABLE` }}",
+      "DYNAMODB_REGION":     "{{ ssm `/aws-mcp-gateway/DYNAMODB_REGION` }}"
     }
   }
 }
