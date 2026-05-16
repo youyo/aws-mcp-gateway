@@ -300,6 +300,27 @@ func TestErrorHandlerReturnsGenericMessage(t *testing.T) {
 	t.Logf("✓ エラー時の汎用メッセージ確認: %q", bodyStr)
 }
 
+// TestSanitizeSessionName: sanitizeSessionName が STS 許可文字 [\w+=,.@-]+ を正しく通過させることを確認
+func TestSanitizeSessionName(t *testing.T) {
+	cases := []struct {
+		input    string
+		expected string
+	}{
+		{"simple", "simple"},
+		{"gw-alice@example.com", "gw-alice@example.com"},
+		{"gw-alice+tag@example.com", "gw-alice+tag@example.com"}, // '+' は STS 許可文字
+		{"gw-alice sub!<>", "gw-alicesub"},                       // スペース・記号は除去
+	}
+	for _, tc := range cases {
+		got := sanitizeSessionName(tc.input)
+		if got != tc.expected {
+			t.Errorf("sanitizeSessionName(%q) = %q, want %q", tc.input, got, tc.expected)
+		} else {
+			t.Logf("✓ sanitizeSessionName(%q) = %q", tc.input, got)
+		}
+	}
+}
+
 // TestOIDCUserLoggingSkipsWhenNoUser: 未認証リクエストではユーザーログがスキップされることを確認
 func TestOIDCUserLoggingSkipsWhenNoUser(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")

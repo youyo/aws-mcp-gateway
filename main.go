@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -77,7 +78,7 @@ func newSigV4RoundTripper(ctx context.Context, region, service string) (*sigV4Ro
 	}
 
 	return &sigV4RoundTripper{
-		base:    http.DefaultTransport,
+		base:    sigV4HTTPTransport,
 		signer:  v4.NewSigner(),
 		region:  region,
 		service: service,
@@ -113,6 +114,21 @@ func (t *sigV4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	return t.base.RoundTrip(req)
 }
 
+// sigV4HTTPTransport は SigV4 署名リクエスト用の共有 HTTP Transport。
+// ResponseHeaderTimeout を設定し、hung upstream による goroutine leak を防ぐ。
+// SSE / Streamable HTTP は ResponseHeader 受信後にストリームが始まるため両立可能。
+var sigV4HTTPTransport = &http.Transport{
+	DialContext: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	MaxIdleConns:          100,
+	MaxIdleConnsPerHost:   20,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ResponseHeaderTimeout: 30 * time.Second,
+}
+
 // federatedCredsCache はユーザーごとの CredentialsCache をキャッシュする。
 // キー: "sub::tokenFingerprint"（8桁の sha256 hex）
 // 同一トークンに対してリクエストごとに STS を呼ぶことを防ぐ。
@@ -132,16 +148,17 @@ func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idT
 
 	if cached, ok := federatedCredsCache.Load(cacheKey); ok {
 		creds := cached.(*aws.CredentialsCache)
-		return &sigV4RoundTripper{
-			base:    http.DefaultTransport,
-			signer:  v4.NewSigner(),
-			region:  region,
-			service: service,
-			getCreds: func(ctx context.Context) (aws.Credentials, error) {
-				return creds.Retrieve(ctx)
-			},
-		}, nil
+		return makeFederatedRoundTripper(creds, cacheKey, region, service), nil
 	}
+
+	// cache miss: 同一 sub の古いトークン fingerprint エントリを削除（メモリリーク防止）
+	oldPrefix := sub + "::"
+	federatedCredsCache.Range(func(k, _ interface{}) bool {
+		if ks, ok := k.(string); ok && strings.HasPrefix(ks, oldPrefix) && ks != cacheKey {
+			federatedCredsCache.Delete(ks)
+		}
+		return true
+	})
 
 	baseCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
@@ -155,18 +172,32 @@ func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idT
 			o.RoleSessionName = sessionName
 		},
 	)
-	creds := aws.NewCredentialsCache(provider)
-	federatedCredsCache.Store(cacheKey, creds)
+	newCreds := aws.NewCredentialsCache(provider)
+	// LoadOrStore で thundering herd を緩和: 並列リクエストが同時に到達した場合、
+	// 先にストアされたエントリを使い、重複ストアを防ぐ。
+	actual, _ := federatedCredsCache.LoadOrStore(cacheKey, newCreds)
+	creds := actual.(*aws.CredentialsCache)
 
+	return makeFederatedRoundTripper(creds, cacheKey, region, service), nil
+}
+
+// makeFederatedRoundTripper は CredentialsCache から per-user SigV4 RoundTripper を生成する。
+// STS 呼び出しが失敗した場合（poisoned entry 防止）、キャッシュエントリを削除して次回再試行を可能にする。
+func makeFederatedRoundTripper(creds *aws.CredentialsCache, cacheKey, region, service string) *sigV4RoundTripper {
 	return &sigV4RoundTripper{
-		base:    http.DefaultTransport,
+		base:    sigV4HTTPTransport,
 		signer:  v4.NewSigner(),
 		region:  region,
 		service: service,
 		getCreds: func(ctx context.Context) (aws.Credentials, error) {
-			return creds.Retrieve(ctx)
+			c, err := creds.Retrieve(ctx)
+			if err != nil {
+				federatedCredsCache.Delete(cacheKey)
+				return aws.Credentials{}, err
+			}
+			return c, nil
 		},
-	}, nil
+	}
 }
 
 // staticTokenRetriever implements stscreds.IdentityTokenRetriever for an in-memory token.
@@ -177,11 +208,12 @@ func (t staticTokenRetriever) GetIdentityToken() ([]byte, error) {
 }
 
 // sanitizeSessionName removes characters not allowed in STS RoleSessionName and truncates to 64 chars.
+// STS allows [\w+=,.@-]+ which includes '+'.
 func sanitizeSessionName(s string) string {
 	var b strings.Builder
 	for _, r := range s {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
-			r == '=' || r == ',' || r == '.' || r == '@' || r == '-' || r == '_' {
+			r == '=' || r == ',' || r == '.' || r == '@' || r == '-' || r == '_' || r == '+' {
 			b.WriteRune(r)
 		}
 	}
@@ -401,7 +433,7 @@ func main() {
 				http.Error(w, "internal server error", http.StatusInternalServerError)
 				return
 			}
-			federatedTransport, ferr := getFederatedRoundTripper(ctx, mcpRegion, awsMCPService, federatedRoleARN, user.IDToken, user.Subject)
+			federatedTransport, ferr := getFederatedRoundTripper(r.Context(), mcpRegion, awsMCPService, federatedRoleARN, user.IDToken, user.Subject)
 			if ferr != nil {
 				slog.Error("failed to get federated round tripper", "error", ferr.Error(), "user_sub", user.Subject)
 				http.Error(w, "internal server error", http.StatusInternalServerError)
