@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -38,6 +39,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go"
 	idproxy "github.com/youyo/idproxy"
 	"github.com/youyo/idproxy/store"
 )
@@ -192,12 +194,38 @@ func makeFederatedRoundTripper(creds *aws.CredentialsCache, cacheKey, region, se
 		getCreds: func(ctx context.Context) (aws.Credentials, error) {
 			c, err := creds.Retrieve(ctx)
 			if err != nil {
-				federatedCredsCache.Delete(cacheKey)
+				// permanent error のみ cache を削除（transient エラーでのキャッシュ thrash 防止）
+				if classifyFederatedError(err) != federatedErrTransient {
+					federatedCredsCache.Delete(cacheKey)
+				}
 				return aws.Credentials{}, err
 			}
 			return c, nil
 		},
 	}
+}
+
+// federatedErrorClass は STS エラーの種別。
+type federatedErrorClass int
+
+const (
+	federatedErrTransient    federatedErrorClass = iota // throttling 等、キャッシュ保持
+	federatedErrInvalidToken                            // IDToken 期限切れ・無効、認証要求
+	federatedErrForbidden                               // AccessDenied、ロール設定の問題
+)
+
+// classifyFederatedError は STS エラーを HTTP 応答用に分類する。
+func classifyFederatedError(err error) federatedErrorClass {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "InvalidIdentityToken", "ExpiredTokenException", "ExpiredToken":
+			return federatedErrInvalidToken
+		case "AccessDenied":
+			return federatedErrForbidden
+		}
+	}
+	return federatedErrTransient
 }
 
 // staticTokenRetriever implements stscreds.IdentityTokenRetriever for an in-memory token.
@@ -439,6 +467,28 @@ func main() {
 				http.Error(w, "internal server error", http.StatusInternalServerError)
 				return
 			}
+
+			// 事前 credentials 取得で STS エラーを HTTP ステータスへ変換する。
+			// CredentialsCache が結果をキャッシュするため、proxy 内の再呼び出しは追加 STS コールにならない。
+			if _, cerr := federatedTransport.getCreds(r.Context()); cerr != nil {
+				switch classifyFederatedError(cerr) {
+				case federatedErrInvalidToken:
+					slog.Warn("federated STS rejected ID Token, client should re-authenticate",
+						"error", cerr.Error(), "user_sub", user.Subject)
+					w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="OIDC ID Token expired or invalid"`)
+					http.Error(w, "invalid_token", http.StatusUnauthorized)
+				case federatedErrForbidden:
+					slog.Warn("federated STS denied access (role trust policy?)",
+						"error", cerr.Error(), "user_sub", user.Subject)
+					http.Error(w, "forbidden", http.StatusForbidden)
+				default:
+					slog.Error("federated STS transient error",
+						"error", cerr.Error(), "user_sub", user.Subject)
+					http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+				}
+				return
+			}
+
 			federatedProxy := buildProxy(target, federatedTransport, targetAWSRegion)
 			federatedProxy.ServeHTTP(w, r)
 			return
