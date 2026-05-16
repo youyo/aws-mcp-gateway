@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.17
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.16
 	github.com/aws/aws-sdk-go-v2/service/sts v1.42.1
-	github.com/youyo/idproxy v0.6.0
+	github.com/youyo/idproxy v0.7.0
 )
 
 require (

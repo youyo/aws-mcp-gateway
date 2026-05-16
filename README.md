@@ -54,6 +54,8 @@ AWS credentials are resolved automatically from the environment (Lambda executio
 | `AWS_MCP_REGION` | Region of the AWS MCP Server endpoint | `us-east-1` |
 | `TARGET_AWS_REGION` | Default AWS region for API operations | `ap-northeast-1` |
 | `ASSUME_ROLE_ARN` | IAM role ARN to assume before signing MCP requests. Requires `sts:AssumeRole` on the runtime role and a trust policy on the target role. All users share session name `aws-mcp-gateway` in CloudTrail. | none (use runtime role) |
+| `IAM_MODE` | `shared` (default): all users share the runtime IAM role. `federated`: each OIDC-authenticated user gets per-user temporary credentials via `AssumeRoleWithWebIdentity` using their ID Token. Requires `AUTH_MODE=oidc` and `FEDERATED_ROLE_ARN`. | `shared` |
+| `FEDERATED_ROLE_ARN` | IAM role ARN to assume via `AssumeRoleWithWebIdentity` in federated mode. The OIDC ID Token is passed to STS; the target role must trust the OIDC issuer. The session name is derived from the user's OIDC `sub` for per-user CloudTrail auditability. | none (required when `IAM_MODE=federated`) |
 | `STORE_BACKEND` | Session store backend: `memory` or `dynamodb` | `memory` |
 | `DYNAMODB_TABLE` | DynamoDB table name (required when `STORE_BACKEND=dynamodb`) | none |
 | `DYNAMODB_REGION` | DynamoDB table region (required when `STORE_BACKEND=dynamodb`) | `ap-northeast-1` |
