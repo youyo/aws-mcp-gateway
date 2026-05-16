@@ -88,35 +88,79 @@ AWS MCP Server はすべてのダウンストリーム AWS API コールに以�
 
 ---
 
-### パターン 1: 読み取り専用（Read-Only）
+### パターン 1: 読み取り専用（Write 系を Deny）
 
-主要サービスへの読み取り専用アクセス。安全な調査・閲覧に適しています。
+MCP 経由の全操作を許可した上で、主要サービスの書き込み・変更操作を Deny します。
+
+> **注意:** Deny-list は完全には列挙できません。マイナーなサービスや新しいアクションが漏れる可能性があります。厳密な読み取り専用制御には `arn:aws:iam::aws:policy/ReadOnlyAccess`（AWS 管理、全サービス対応）または AWS Organizations の Service Control Policy を使用してください。
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "ReadOnlyViaMCP",
+      "Sid": "AllowAllViaMCP",
       "Effect": "Allow",
-      "Action": [
-        "ec2:Describe*", "ec2:Get*",
-        "s3:Get*", "s3:List*",
-        "rds:Describe*",
-        "ecs:Describe*", "ecs:List*",
-        "eks:Describe*", "eks:List*",
-        "lambda:Get*", "lambda:List*",
-        "cloudwatch:Describe*", "cloudwatch:Get*", "cloudwatch:List*",
-        "cloudtrail:Describe*", "cloudtrail:Get*", "cloudtrail:List*",
-        "iam:Get*", "iam:List*",
-        "ssm:Describe*", "ssm:Get*", "ssm:List*"
-      ],
+      "Action": "*",
       "Resource": "*",
       "Condition": {
         "StringEquals": {
           "aws:CalledViaAWSMCP": "aws-mcp.amazonaws.com"
         }
       }
+    },
+    {
+      "Sid": "DenyWriteActions",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:Create*", "ec2:Delete*", "ec2:Modify*", "ec2:Put*",
+        "ec2:Terminate*", "ec2:Start*", "ec2:Stop*", "ec2:Reboot*",
+        "ec2:Attach*", "ec2:Detach*", "ec2:Associate*", "ec2:Disassociate*",
+        "ec2:Run*", "ec2:Import*", "ec2:Copy*",
+        "s3:Put*", "s3:Delete*", "s3:Create*", "s3:Restore*",
+        "rds:Create*", "rds:Delete*", "rds:Modify*", "rds:Restore*", "rds:Start*", "rds:Stop*",
+        "iam:Create*", "iam:Delete*", "iam:Put*", "iam:Update*",
+        "iam:Attach*", "iam:Detach*", "iam:PassRole", "iam:AddRoleToInstanceProfile",
+        "lambda:Create*", "lambda:Delete*", "lambda:Update*", "lambda:Put*",
+        "lambda:Add*", "lambda:Remove*", "lambda:Invoke*", "lambda:Publish*",
+        "ecs:Create*", "ecs:Delete*", "ecs:Update*", "ecs:Put*",
+        "ecs:Register*", "ecs:Deregister*", "ecs:Start*", "ecs:Stop*", "ecs:Submit*",
+        "eks:Create*", "eks:Delete*", "eks:Update*", "eks:Associate*", "eks:Register*",
+        "cloudformation:Create*", "cloudformation:Delete*", "cloudformation:Update*",
+        "cloudformation:Execute*", "cloudformation:Set*",
+        "dynamodb:Create*", "dynamodb:Delete*", "dynamodb:Update*",
+        "dynamodb:Put*", "dynamodb:Batch*", "dynamodb:Transact*",
+        "kms:Create*", "kms:Delete*", "kms:Update*", "kms:Disable*",
+        "kms:Enable*", "kms:Put*", "kms:Schedule*", "kms:Import*",
+        "secretsmanager:Create*", "secretsmanager:Delete*", "secretsmanager:Put*",
+        "secretsmanager:Update*", "secretsmanager:Rotate*", "secretsmanager:Cancel*",
+        "logs:Create*", "logs:Delete*", "logs:Put*", "logs:Tag*", "logs:Untag*",
+        "cloudwatch:Delete*", "cloudwatch:Put*", "cloudwatch:Set*", "cloudwatch:Tag*",
+        "route53:Create*", "route53:Delete*", "route53:Update*", "route53:Change*",
+        "sns:Create*", "sns:Delete*", "sns:Set*", "sns:Subscribe*",
+        "sns:Unsubscribe*", "sns:Publish*", "sns:Add*", "sns:Remove*",
+        "sqs:Create*", "sqs:Delete*", "sqs:Set*", "sqs:Send*",
+        "sqs:Purge*", "sqs:Change*", "sqs:Tag*",
+        "ecr:Create*", "ecr:Delete*", "ecr:Put*", "ecr:Initiate*",
+        "ecr:Upload*", "ecr:Batch*", "ecr:Set*", "ecr:Tag*",
+        "elasticloadbalancing:Create*", "elasticloadbalancing:Delete*",
+        "elasticloadbalancing:Modify*", "elasticloadbalancing:Register*",
+        "elasticloadbalancing:Deregister*", "elasticloadbalancing:Set*",
+        "autoscaling:Create*", "autoscaling:Delete*", "autoscaling:Update*",
+        "autoscaling:Set*", "autoscaling:Attach*", "autoscaling:Detach*",
+        "autoscaling:Execute*", "autoscaling:Put*",
+        "cloudfront:Create*", "cloudfront:Delete*", "cloudfront:Update*",
+        "cloudfront:Associate*", "cloudfront:Publish*", "cloudfront:Tag*",
+        "ssm:Create*", "ssm:Delete*", "ssm:Update*", "ssm:Put*",
+        "ssm:Register*", "ssm:Deregister*", "ssm:Start*", "ssm:Stop*",
+        "ssm:Send*", "ssm:Cancel*", "ssm:Label*",
+        "events:Create*", "events:Delete*", "events:Put*",
+        "events:Update*", "events:Enable*", "events:Disable*", "events:Tag*",
+        "stepfunctions:Create*", "stepfunctions:Delete*", "stepfunctions:Update*",
+        "stepfunctions:Start*", "stepfunctions:Stop*", "stepfunctions:Send*",
+        "apigateway:POST", "apigateway:PUT", "apigateway:PATCH", "apigateway:DELETE"
+      ],
+      "Resource": "*"
     }
   ]
 }
