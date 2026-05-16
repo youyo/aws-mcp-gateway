@@ -222,7 +222,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	http.Handle("/", auth.Wrap(proxy))
+	// Log OIDC user identity on every authenticated request for audit traceability.
+	// This enables correlating gateway access logs (who) with CloudTrail (what AWS actions).
+	loggingProxy := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user := idproxy.UserFromContext(r.Context())
+		if user != nil {
+			slog.Info("request",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"user_email", user.Email,
+				"user_sub", user.Subject,
+				"remote_addr", r.RemoteAddr,
+			)
+		}
+		proxy.ServeHTTP(w, r)
+	})
+
+	http.Handle("/", auth.Wrap(loggingProxy))
 
 	slog.Info("aws-mcp-gateway started",
 		"addr", ":"+port,

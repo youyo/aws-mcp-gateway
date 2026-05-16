@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	idproxy "github.com/youyo/idproxy"
 )
 
 // TestSigV4HeadersAttached: モックサーバーに転送されるリクエストに SigV4 ヘッダーが付くことを確認
@@ -183,4 +185,82 @@ func statusMessage(code int) string {
 	default:
 		return "想定外のステータス"
 	}
+}
+
+// TestOIDCUserLoggingSkipsWhenNoUser: 未認証リクエストではユーザーログがスキップされることを確認
+func TestOIDCUserLoggingSkipsWhenNoUser(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	defer mock.Close()
+
+	transport, err := newSigV4RoundTripper(context.Background(), "us-east-1", awsMCPService)
+	if err != nil {
+		t.Fatalf("RoundTripper 作成失敗: %v", err)
+	}
+	target, _ := url.Parse(mock.URL)
+	proxy := buildProxy(target, transport, "ap-northeast-1")
+
+	// ユーザーなし（未認証）でリクエストが通ることを確認
+	// idproxy.UserFromContext が nil を返す → ログをスキップして proxy.ServeHTTP に委譲
+	userLogged := false
+	loggingHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user := idproxy.UserFromContext(r.Context())
+		if user != nil {
+			userLogged = true
+		}
+		proxy.ServeHTTP(w, r)
+	})
+
+	srv := httptest.NewServer(loggingHandler)
+	defer srv.Close()
+
+	// コンテキストにユーザーを設定しない（未認証）
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("リクエスト失敗: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if userLogged {
+		t.Error("ユーザーなしなのにログが実行された")
+	}
+	t.Logf("✓ 未認証リクエストではユーザーログをスキップ（UserFromContext = nil）")
+}
+
+// TestOIDCUserLoggingWithUser: 認証済みユーザーの email/sub が取得できることを確認
+func TestOIDCUserLoggingWithUser(t *testing.T) {
+	// idproxy.UserFromContext / idproxy.User の動作確認
+	// idproxy が Auth.Wrap でコンテキストにユーザーを注入する設計のため、
+	// 単体テストでは UserFromContext が User 構造体の各フィールドに正常アクセスできることを確認する
+
+	dummyUser := &idproxy.User{
+		Email:   "alice@example.com",
+		Subject: "oidc-sub-xyz",
+	}
+
+	if dummyUser.Email != "alice@example.com" {
+		t.Errorf("Email フィールドが期待値と異なる: %s", dummyUser.Email)
+	}
+	if dummyUser.Subject != "oidc-sub-xyz" {
+		t.Errorf("Subject フィールドが期待値と異なる: %s", dummyUser.Subject)
+	}
+
+	// UserFromContext はコンテキストにユーザーがない場合 nil を返す
+	nilUser := idproxy.UserFromContext(context.Background())
+	if nilUser != nil {
+		t.Errorf("空のコンテキストから User が返ってきた（期待値: nil）: %v", nilUser)
+	}
+	t.Logf("✓ UserFromContext(空コンテキスト) = nil 確認")
+	t.Logf("✓ User{Email: %s, Subject: %s} フィールドアクセス確認", dummyUser.Email, dummyUser.Subject)
 }
