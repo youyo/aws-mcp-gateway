@@ -28,6 +28,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -136,6 +137,8 @@ func buildProxy(target *url.URL, transport http.RoundTripper, targetAWSRegion st
 			r.Out.Host = target.Host
 			r.Out.URL.Path = target.Path
 			r.Out.Header.Set("x-amz-mcp-metadata-aws_region", targetAWSRegion)
+			// Remove session cookies — they must not be forwarded to the upstream AWS MCP Server.
+			r.Out.Header.Del("Cookie")
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			slog.Info("upstream response",
@@ -147,7 +150,8 @@ func buildProxy(target *url.URL, transport http.RoundTripper, targetAWSRegion st
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			slog.Error("proxy error", "error", err.Error())
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			// Return a generic message to avoid leaking upstream details (endpoint URLs, AWS error structures, etc.)
+			http.Error(w, "bad gateway", http.StatusBadGateway)
 		},
 	}
 }
@@ -187,7 +191,15 @@ func main() {
 	externalURL := mustEnv("EXTERNAL_URL")
 	oidcIssuer := mustEnv("OIDC_ISSUER")
 	oidcClientID := mustEnv("OIDC_CLIENT_ID")
-	oidcClientSecret := os.Getenv("OIDC_CLIENT_SECRET")
+	oidcClientSecret := mustEnv("OIDC_CLIENT_SECRET")
+	allowedDomains := os.Getenv("ALLOWED_DOMAINS")
+	allowedEmails := os.Getenv("ALLOWED_EMAILS")
+	// Check the parsed result (not the raw strings) to catch whitespace-only values.
+	parsedDomains := splitCSV(allowedDomains)
+	parsedEmails := splitCSV(allowedEmails)
+	if len(parsedDomains) == 0 && len(parsedEmails) == 0 {
+		slog.Warn("ALLOWED_DOMAINS and ALLOWED_EMAILS are both empty — ANY authenticated user in the OIDC tenant can access the gateway. Set at least one to restrict access.")
+	}
 
 	cookieSecretHex := os.Getenv("COOKIE_SECRET")
 	var cookieSecret []byte
@@ -234,9 +246,7 @@ func main() {
 		Issuer:   oidcIssuer,
 		ClientID: oidcClientID,
 	}
-	if oidcClientSecret != "" {
-		provider.ClientSecret = oidcClientSecret
-	}
+	provider.ClientSecret = oidcClientSecret
 
 	// Select session store backend via STORE_BACKEND env var.
 	// "dynamodb" requires DYNAMODB_TABLE and DYNAMODB_REGION.
@@ -248,14 +258,17 @@ func main() {
 	}
 
 	authCfg := idproxy.Config{
-		Providers:    []idproxy.OIDCProvider{provider},
-		ExternalURL:  externalURL,
-		CookieSecret: cookieSecret,
-		Store:        sessionStore,
+		Providers:      []idproxy.OIDCProvider{provider},
+		ExternalURL:    externalURL,
+		CookieSecret:   cookieSecret,
+		Store:          sessionStore,
+		AllowedDomains: parsedDomains,
+		AllowedEmails:  parsedEmails,
 		OAuth: &idproxy.OAuthConfig{
 			SigningKey: signingKey,
 		},
 	}
+	authCfg.UseStrictPostLoginRedirectValidator()
 
 	auth, err := idproxy.New(ctx, authCfg)
 	if err != nil {
@@ -290,8 +303,29 @@ func main() {
 		"oidc_issuer", oidcIssuer,
 	)
 
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	srv := &http.Server{
+		Addr:              ":" + port,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		// WriteTimeout is intentionally not set to support long-running SSE / Streamable HTTP responses.
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		slog.Error("server error", "error", err.Error())
 		os.Exit(1)
 	}
+}
+
+// splitCSV splits a comma-separated string into a trimmed slice, returning nil for empty input.
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			result = append(result, v)
+		}
+	}
+	return result
 }

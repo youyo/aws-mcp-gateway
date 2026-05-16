@@ -41,12 +41,14 @@ AWS credentials are resolved automatically from the environment (Lambda executio
 | `EXTERNAL_URL` | Public URL of this gateway | `https://aws-mcp.example.com` |
 | `OIDC_ISSUER` | OIDC Issuer URL | `https://login.microsoftonline.com/{tenant-id}/v2.0` |
 | `OIDC_CLIENT_ID` | OAuth Client ID | `your-client-id` |
+| `OIDC_CLIENT_SECRET` | OAuth Client Secret | `your-client-secret` |
 
 ### Optional
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `OIDC_CLIENT_SECRET` | OAuth Client Secret | none |
+| `ALLOWED_DOMAINS` | Comma-separated allowed email domains (e.g. `example.com,corp.example.com`). If both are unset, **any user in the OIDC tenant can authenticate** — a warning is logged but the gateway still starts. Case-insensitive. Note: the allowlist is only checked at login time; issued tokens remain valid until expiry even if the allowlist is tightened. | none |
+| `ALLOWED_EMAILS` | Comma-separated allowed email addresses. Combined with `ALLOWED_DOMAINS` (OR logic). Case-insensitive. | none |
 | `COOKIE_SECRET` | Cookie encryption key (hex-encoded, 32+ bytes) | Random (sessions lost on restart) |
 | `AWS_MCP_ENDPOINT` | AWS MCP Server endpoint URL (overrides `AWS_MCP_REGION`) | derived from `AWS_MCP_REGION` |
 | `AWS_MCP_REGION` | Region of the AWS MCP Server endpoint | `us-east-1` |

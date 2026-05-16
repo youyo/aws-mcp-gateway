@@ -187,6 +187,119 @@ func statusMessage(code int) string {
 	}
 }
 
+// TestSplitCSV: splitCSV のエッジケースを確認
+func TestSplitCSV(t *testing.T) {
+	cases := []struct {
+		input    string
+		expected []string
+	}{
+		{"", nil},
+		{" ", nil},       // 空白のみ → nil（ALLOWED_DOMAINS=" " 設定ミスのケース）
+		{",", nil},       // カンマのみ → nil
+		{"example.com", []string{"example.com"}},
+		{"example.com,corp.example.com", []string{"example.com", "corp.example.com"}},
+		{" example.com , corp.example.com ", []string{"example.com", "corp.example.com"}}, // 前後空白のトリム
+		{"example.com,,corp.example.com", []string{"example.com", "corp.example.com"}},    // 空要素のスキップ
+	}
+
+	for _, tc := range cases {
+		got := splitCSV(tc.input)
+		if len(got) != len(tc.expected) {
+			t.Errorf("splitCSV(%q) = %v, want %v", tc.input, got, tc.expected)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.expected[i] {
+				t.Errorf("splitCSV(%q)[%d] = %q, want %q", tc.input, i, got[i], tc.expected[i])
+			}
+		}
+		t.Logf("✓ splitCSV(%q) = %v", tc.input, got)
+	}
+}
+
+// TestCookieHeaderRemovedFromUpstream: セッション Cookie がアップストリームに転送されないことを確認
+func TestCookieHeaderRemovedFromUpstream(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	var capturedCookie string
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedCookie = r.Header.Get("Cookie")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{}`))
+	}))
+	defer mock.Close()
+
+	transport, err := newSigV4RoundTripper(context.Background(), "us-east-1", awsMCPService)
+	if err != nil {
+		t.Fatalf("RoundTripper 作成失敗: %v", err)
+	}
+	target, _ := url.Parse(mock.URL)
+	proxy := buildProxy(target, transport, "ap-northeast-1")
+	srv := httptest.NewServer(proxy)
+	defer srv.Close()
+
+	// Cookie ヘッダーを付けてリクエスト
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", "_idproxy_session=sensitive-session-value")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("リクエスト失敗: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if capturedCookie != "" {
+		t.Errorf("Cookie ヘッダーがアップストリームに転送された: %s", capturedCookie)
+	} else {
+		t.Logf("✓ Cookie ヘッダーがアップストリームに転送されていない（セッション保護 OK）")
+	}
+}
+
+// TestErrorHandlerReturnsGenericMessage: プロキシエラー時に汎用メッセージが返ることを確認
+func TestErrorHandlerReturnsGenericMessage(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	// 存在しないエンドポイント（即座に接続失敗）
+	target, _ := url.Parse("http://127.0.0.1:19999")
+	transport, err := newSigV4RoundTripper(context.Background(), "us-east-1", awsMCPService)
+	if err != nil {
+		t.Fatalf("RoundTripper 作成失敗: %v", err)
+	}
+	proxy := buildProxy(target, transport, "ap-northeast-1")
+	srv := httptest.NewServer(proxy)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("リクエスト失敗: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("期待値 502、実際: %d", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := strings.TrimSpace(string(body))
+	// 内部詳細（URLやエラー文字列）が含まれていないことを確認
+	if strings.Contains(bodyStr, "127.0.0.1") || strings.Contains(bodyStr, "connection refused") {
+		t.Errorf("エラー詳細がクライアントに露出している: %s", bodyStr)
+	}
+	if bodyStr != "bad gateway" {
+		t.Errorf("汎用メッセージでない: %q", bodyStr)
+	}
+	t.Logf("✓ エラー時の汎用メッセージ確認: %q", bodyStr)
+}
+
 // TestOIDCUserLoggingSkipsWhenNoUser: 未認証リクエストではユーザーログがスキップされることを確認
 func TestOIDCUserLoggingSkipsWhenNoUser(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
