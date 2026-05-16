@@ -51,7 +51,7 @@ AWS credentials are resolved automatically from the environment (Lambda executio
 | `AWS_MCP_ENDPOINT` | AWS MCP Server endpoint URL (overrides `AWS_MCP_REGION`) | derived from `AWS_MCP_REGION` |
 | `AWS_MCP_REGION` | Region of the AWS MCP Server endpoint | `us-east-1` |
 | `TARGET_AWS_REGION` | Default AWS region for API operations | `ap-northeast-1` |
-| `ASSUME_ROLE_ARN` | IAM role ARN to assume before signing MCP requests | none (use runtime role) |
+| `ASSUME_ROLE_ARN` | IAM role ARN to assume before signing MCP requests. Requires `sts:AssumeRole` on the runtime role and a trust policy on the target role. All users share session name `aws-mcp-gateway` in CloudTrail. | none (use runtime role) |
 | `STORE_BACKEND` | Session store backend: `memory` or `dynamodb` | `memory` |
 | `DYNAMODB_TABLE` | DynamoDB table name (required when `STORE_BACKEND=dynamodb`) | none |
 | `DYNAMODB_REGION` | DynamoDB table region (required when `STORE_BACKEND=dynamodb`) | `ap-northeast-1` |
