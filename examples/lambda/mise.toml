@@ -93,6 +93,61 @@ lambroll deploy \
 
 # ── Infrastructure Setup (one-time) ──────────────────────────────────────────
 
+[tasks."iam:create"]
+description = "Create Lambda execution role with required policies"
+run = """
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+ROLE_NAME="${INSTANCE_NAME}-lambda-role"
+
+# Create role
+aws iam create-role \
+  --role-name "${ROLE_NAME}" \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
+# Basic Lambda permissions (CloudWatch Logs)
+aws iam attach-role-policy \
+  --role-name "${ROLE_NAME}" \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+# AWS MCP access (ReadOnly — adjust as needed)
+aws iam attach-role-policy \
+  --role-name "${ROLE_NAME}" \
+  --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess
+
+# DynamoDB session store
+aws iam put-role-policy \
+  --role-name "${ROLE_NAME}" \
+  --policy-name dynamodb-session-store \
+  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\",\"dynamodb:PutItem\",\"dynamodb:DeleteItem\"],\"Resource\":\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${INSTANCE_NAME}\"}]}"
+
+ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+echo "Role created: ${ROLE_ARN}"
+echo ""
+echo "Add to .env:"
+echo "  ROLE_ARN=${ROLE_ARN}"
+"""
+
+[tasks."iam:delete"]
+description = "Delete Lambda execution role and all attached policies (destructive)"
+run = """
+ROLE_NAME="${INSTANCE_NAME}-lambda-role"
+
+aws iam detach-role-policy \
+  --role-name "${ROLE_NAME}" \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole 2>/dev/null || true
+
+aws iam detach-role-policy \
+  --role-name "${ROLE_NAME}" \
+  --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess 2>/dev/null || true
+
+aws iam delete-role-policy \
+  --role-name "${ROLE_NAME}" \
+  --policy-name dynamodb-session-store 2>/dev/null || true
+
+aws iam delete-role --role-name "${ROLE_NAME}"
+echo "Role ${ROLE_NAME} deleted."
+"""
+
 [tasks."dynamodb:create"]
 description = "Create DynamoDB session store table with TTL"
 run = """
@@ -120,3 +175,13 @@ aws dynamodb delete-table \
   --table-name "${INSTANCE_NAME}"
 echo "Table ${INSTANCE_NAME} deletion requested."
 """
+
+# ── Convenience ───────────────────────────────────────────────────────────────
+
+[tasks.setup]
+description = "One-time infrastructure setup: IAM role + DynamoDB (then set ROLE_ARN in .env)"
+depends = ["iam:create", "dynamodb:create"]
+
+[tasks.teardown]
+description = "Destroy all infrastructure for this INSTANCE_NAME (destructive)"
+depends = ["dynamodb:delete", "iam:delete"]
