@@ -92,7 +92,7 @@ Use `aws:CalledViaAWSMCP` to restrict permissions to a specific MCP server. Use 
 
 Attach the AWS-managed `ReadOnlyAccess` policy. Covers all AWS services and is automatically updated as new services are added.
 
-> **Note:** AWS managed policies cannot carry IAM conditions, so `aws:CalledViaAWSMCP` cannot be applied. Since this role is dedicated to the gateway, the risk is limited — but be aware that any process running with this role can read AWS resources directly, not just via MCP.
+> **Note:** AWS managed policies cannot carry IAM conditions, so `aws:CalledViaAWSMCP` cannot be applied. Any process running with this role can read AWS resources directly, not only via MCP. `ReadOnlyAccess` includes broad read access (logs, parameters, secrets metadata, IAM configurations) — evaluate whether this is acceptable for your environment. For production with strict controls, use a customer-managed least-privilege read policy instead.
 
 ```bash
 # Create role (example: for ECS task)
@@ -234,9 +234,15 @@ aws iam put-role-policy \
 
 `ReadOnlyAccess` plus an inline policy that grants execution permissions needed for incident investigation.
 
-> ⚠️ **The inline policy grants remote execution permissions**, not read-only.
-> - `ssm:SendCommand` / `ecs:ExecuteCommand` — equivalent to remote shell access on instances and containers. Can read secrets, credentials, and filesystem data.
+> ⚠️ **Important: `ReadOnlyAccess` is NOT restricted to MCP paths.** Because AWS managed policies cannot carry IAM conditions, the read permissions from `ReadOnlyAccess` apply regardless of whether the call comes through MCP or directly. Only the **inline execution permissions** are gated by `aws:CalledViaAWSMCP`.
+>
+> In practice this role has: **always-on broad read** (via `ReadOnlyAccess`) + **MCP-only execution** (via inline policy).
+>
+> ⚠️ **The inline policy grants remote execution permissions:**
+> - `ssm:SendCommand` / `ecs:ExecuteCommand` — equivalent to remote shell access. Can expose secrets, credentials, and filesystem data.
 > - `lambda:InvokeFunction` — executes business logic with potential side effects.
+>
+> **`Resource: "*"` in the example is simplified.** In production, scope to specific ARNs, tags, or SSM documents.
 >
 > **Required audit logging** (CloudTrail alone is insufficient):
 > - SSM Session Manager: enable session logging to S3/CloudWatch Logs
@@ -286,7 +292,7 @@ aws iam create-role \
     }]
   }'
 
-# ReadOnlyAccess covers all read operations
+# ReadOnlyAccess covers all read operations (no MCP condition — managed policies cannot carry conditions)
 aws iam attach-role-policy \
   --role-name aws-mcp-gateway-debug \
   --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess
