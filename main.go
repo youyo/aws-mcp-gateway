@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -112,26 +113,50 @@ func (t *sigV4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	return t.base.RoundTrip(req)
 }
 
-// newFederatedRoundTripper creates a SigV4 RoundTripper that uses per-user AWS credentials
-// obtained via AssumeRoleWithWebIdentity with the user's OIDC ID Token.
-// The session name is derived from the user's OIDC sub for CloudTrail auditability.
-func newFederatedRoundTripper(ctx context.Context, region, service, roleARN, idToken, sub string) (*sigV4RoundTripper, error) {
+// federatedCredsCache はユーザーごとの CredentialsCache をキャッシュする。
+// キー: "sub::tokenFingerprint"（8桁の sha256 hex）
+// 同一トークンに対してリクエストごとに STS を呼ぶことを防ぐ。
+var federatedCredsCache sync.Map
+
+// tokenFingerprint は ID Token の sha256 上位 4 バイトを hex 文字列で返す。
+// キャッシュキーのトークン同一性チェックに使用する（全文保持を避ける）。
+func tokenFingerprint(idToken string) string {
+	h := sha256.Sum256([]byte(idToken))
+	return hex.EncodeToString(h[:4])
+}
+
+// getFederatedRoundTripper は (sub, idToken) をキーに CredentialsCache をキャッシュし、
+// per-user SigV4 RoundTripper を返す。同一トークンでの二回目以降は STS 呼び出しなし。
+func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idToken, sub string) (*sigV4RoundTripper, error) {
+	cacheKey := sub + "::" + tokenFingerprint(idToken)
+
+	if cached, ok := federatedCredsCache.Load(cacheKey); ok {
+		creds := cached.(*aws.CredentialsCache)
+		return &sigV4RoundTripper{
+			base:    http.DefaultTransport,
+			signer:  v4.NewSigner(),
+			region:  region,
+			service: service,
+			getCreds: func(ctx context.Context) (aws.Credentials, error) {
+				return creds.Retrieve(ctx)
+			},
+		}, nil
+	}
+
 	baseCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config for federated role: %w", err)
 	}
 
-	// Sanitize sub for STS session name (max 64 chars, alphanumeric and =,.@-_ only)
 	sessionName := sanitizeSessionName("gw-" + sub)
-
 	stsClient := sts.NewFromConfig(baseCfg)
-	// Use a static token retriever that returns the OIDC ID Token directly.
 	provider := stscreds.NewWebIdentityRoleProvider(stsClient, roleARN, staticTokenRetriever(idToken),
 		func(o *stscreds.WebIdentityRoleOptions) {
 			o.RoleSessionName = sessionName
 		},
 	)
-	federatedCreds := aws.NewCredentialsCache(provider)
+	creds := aws.NewCredentialsCache(provider)
+	federatedCredsCache.Store(cacheKey, creds)
 
 	return &sigV4RoundTripper{
 		base:    http.DefaultTransport,
@@ -139,7 +164,7 @@ func newFederatedRoundTripper(ctx context.Context, region, service, roleARN, idT
 		region:  region,
 		service: service,
 		getCreds: func(ctx context.Context) (aws.Credentials, error) {
-			return federatedCreds.Retrieve(ctx)
+			return creds.Retrieve(ctx)
 		},
 	}, nil
 }
@@ -360,14 +385,25 @@ func main() {
 			)
 		}
 
-		// In federated mode, create per-request SigV4 transport using the user's ID Token.
-		// The OIDC ID Token is passed to STS AssumeRoleWithWebIdentity, yielding user-scoped
-		// temporary credentials. CloudTrail will record the assumed role session with the
-		// user's sub as the session name for per-user auditability.
-		if iamMode == "federated" && user != nil && user.IDToken != "" {
-			federatedTransport, ferr := newFederatedRoundTripper(ctx, mcpRegion, awsMCPService, federatedRoleARN, user.IDToken, user.Subject)
+		// federated モードでは IDToken が必須。空の場合は shared role へのフォールバックを防ぐ。
+		// IDToken は StoreIDToken=true + authorization_code フローで取得される。
+		// 欠落時は 500 を返す（fail-closed）。
+		if iamMode == "federated" {
+			userSub := ""
+			if user != nil {
+				userSub = user.Subject
+			}
+			if user == nil || user.IDToken == "" {
+				slog.Error("federated mode requires IDToken but none available",
+					"user_sub", userSub,
+					"hint", "ensure StoreIDToken=true and user authenticated via OIDC browser flow",
+				)
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+				return
+			}
+			federatedTransport, ferr := getFederatedRoundTripper(ctx, mcpRegion, awsMCPService, federatedRoleARN, user.IDToken, user.Subject)
 			if ferr != nil {
-				slog.Error("failed to create federated round tripper", "error", ferr.Error(), "user_sub", user.Subject)
+				slog.Error("failed to get federated round tripper", "error", ferr.Error(), "user_sub", user.Subject)
 				http.Error(w, "internal server error", http.StatusInternalServerError)
 				return
 			}
