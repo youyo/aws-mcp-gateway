@@ -51,6 +51,10 @@ AWS credentials are resolved automatically from the environment (Lambda executio
 | `AWS_MCP_ENDPOINT` | AWS MCP Server endpoint URL (overrides `AWS_MCP_REGION`) | derived from `AWS_MCP_REGION` |
 | `AWS_MCP_REGION` | Region of the AWS MCP Server endpoint | `us-east-1` |
 | `TARGET_AWS_REGION` | Default AWS region for API operations | `ap-northeast-1` |
+| `ASSUME_ROLE_ARN` | IAM role ARN to assume before signing MCP requests | none (use runtime role) |
+| `STORE_BACKEND` | Session store backend: `memory` or `dynamodb` | `memory` |
+| `DYNAMODB_TABLE` | DynamoDB table name (required when `STORE_BACKEND=dynamodb`) | none |
+| `DYNAMODB_REGION` | DynamoDB table region (required when `STORE_BACKEND=dynamodb`) | `ap-northeast-1` |
 | `PORT` | Listen port | `8080` |
 
 > **Note:** `AWS_MCP_REGION` controls which MCP server endpoint to connect to (`us-east-1` or `eu-central-1`). When a new region becomes available, just change this variable. `TARGET_AWS_REGION` sets the default region for AWS operations — these can be different.

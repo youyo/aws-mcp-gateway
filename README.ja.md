@@ -51,6 +51,10 @@ AWS 認証情報は環境から自動解決されます（Lambda 実行ロール
 | `AWS_MCP_ENDPOINT` | AWS MCP Server エンドポイント URL（`AWS_MCP_REGION` より優先） | `AWS_MCP_REGION` から自動生成 |
 | `AWS_MCP_REGION` | AWS MCP Server エンドポイントのリージョン | `us-east-1` |
 | `TARGET_AWS_REGION` | AWS API 操作のデフォルトリージョン | `ap-northeast-1` |
+| `ASSUME_ROLE_ARN` | MCP リクエスト署名前に Assume Role する IAM ロール ARN | なし（ランタイムロールを使用） |
+| `STORE_BACKEND` | セッションストアのバックエンド: `memory` または `dynamodb` | `memory` |
+| `DYNAMODB_TABLE` | DynamoDB テーブル名（`STORE_BACKEND=dynamodb` 時必須） | なし |
+| `DYNAMODB_REGION` | DynamoDB テーブルのリージョン（`STORE_BACKEND=dynamodb` 時必須） | `ap-northeast-1` |
 | `PORT` | リスンポート | `8080` |
 
 > **Note:** `AWS_MCP_REGION` は接続先 MCP サーバーエンドポイントのリージョンです。新リージョンが追加された場合はこの変数を変更するだけで対応できます。`TARGET_AWS_REGION` は AWS の操作対象リージョンで、両者は異なっていて構いません。
