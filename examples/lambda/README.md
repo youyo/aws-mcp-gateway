@@ -127,7 +127,8 @@ aws iam put-role-policy \
           "lambda:UpdateFunctionConfiguration", "lambda:GetFunction",
           "lambda:GetFunctionConfiguration", "lambda:PublishVersion",
           "lambda:CreateAlias", "lambda:UpdateAlias", "lambda:GetAlias",
-          "lambda:ListFunctions", "lambda:AddPermission",
+          "lambda:ListFunctions",
+          "lambda:AddPermission", "lambda:RemovePermission", "lambda:GetPolicy",
           "lambda:CreateFunctionUrlConfig", "lambda:UpdateFunctionUrlConfig",
           "lambda:GetFunctionUrlConfig"
         ],
@@ -202,10 +203,11 @@ aws ssm put-parameter --region $REGION --type String --name /aws-mcp-gateway/TAR
 
 ## Deploy
 
-### Manual deploy
+> **First-time deployment requires 2 steps** because the Function URL (needed for `EXTERNAL_URL`) is only known after the first deploy.
+
+### Step 1 — Initial deploy (without Function URL)
 
 ```bash
-# 1. Download binary for arm64 Linux
 VERSION=0.3.0  # update to latest release
 curl -fsSL -o aws-mcp-gateway.tar.gz \
   "https://github.com/youyo/aws-mcp-gateway/releases/download/v${VERSION}/aws-mcp-gateway_${VERSION}_Linux_arm64.tar.gz"
@@ -213,15 +215,59 @@ tar xzf aws-mcp-gateway.tar.gz aws-mcp-gateway
 mv aws-mcp-gateway bootstrap
 zip -j function.zip bootstrap
 
-# 2. Deploy with lambroll
+# Deploy function only (no Function URL yet)
 ROLE_ARN=arn:aws:iam::<ACCOUNT_ID>:role/aws-mcp-gateway-lambda-role \
 AWS_REGION=ap-northeast-1 \
 lambroll deploy \
   --function examples/lambda/function.json \
-  --function-url examples/lambda/function_url.json
+  --src function.zip
 ```
 
-### GitHub Actions
+### Step 2 — Set EXTERNAL_URL and create Function URL
+
+```bash
+# Get the Function URL
+FUNCTION_URL=$(aws lambda get-function-url-config \
+  --function-name aws-mcp-gateway \
+  --query 'FunctionUrl' --output text 2>/dev/null || echo "")
+
+if [ -z "$FUNCTION_URL" ]; then
+  # Create Function URL on first run
+  aws lambda create-function-url-config \
+    --function-name aws-mcp-gateway \
+    --auth-type NONE \
+    --invoke-mode RESPONSE_STREAM
+  FUNCTION_URL=$(aws lambda get-function-url-config \
+    --function-name aws-mcp-gateway \
+    --query 'FunctionUrl' --output text)
+fi
+
+echo "Function URL: $FUNCTION_URL"
+
+# Update EXTERNAL_URL in SSM (strip trailing slash)
+aws ssm put-parameter \
+  --name /aws-mcp-gateway/EXTERNAL_URL \
+  --value "${FUNCTION_URL%/}" \
+  --type SecureString --overwrite
+
+# Re-deploy with Function URL and updated EXTERNAL_URL
+ROLE_ARN=arn:aws:iam::<ACCOUNT_ID>:role/aws-mcp-gateway-lambda-role \
+AWS_REGION=ap-northeast-1 \
+lambroll deploy \
+  --function examples/lambda/function.json \
+  --function-url examples/lambda/function_url.json \
+  --src function.zip
+```
+
+### Subsequent deploys (GitHub Actions)
+
+After the initial setup, push a tag to trigger automated deployment:
+
+```bash
+git tag v0.3.0 && git push origin v0.3.0
+```
+
+### GitHub Actions (after initial setup)
 
 Copy `.github/workflows/deploy.yml` to your repository and set:
 
@@ -229,12 +275,6 @@ Copy `.github/workflows/deploy.yml` to your repository and set:
 |---|---|
 | `vars.AWS_DEPLOY_ROLE_ARN` | Deploy role ARN (`aws-mcp-gateway-deploy-role`) |
 | `vars.LAMBDA_ROLE_ARN` | Lambda execution role ARN (`aws-mcp-gateway-lambda-role`) |
-
-Push a tag to trigger deployment:
-
-```bash
-git tag v0.3.0 && git push origin v0.3.0
-```
 
 ## MCP Client Configuration
 

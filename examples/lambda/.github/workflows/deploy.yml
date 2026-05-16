@@ -57,4 +57,8 @@ jobs:
       - name: Lambroll deploy
         env:
           ROLE_ARN: ${{ vars.LAMBDA_ROLE_ARN }}
-        run: lambroll deploy --function examples/lambda/function.json --function-url examples/lambda/function_url.json
+        run: |
+          lambroll deploy \
+            --function examples/lambda/function.json \
+            --function-url examples/lambda/function_url.json \
+            --src function.zip
