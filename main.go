@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -254,6 +255,61 @@ func sanitizeSessionName(s string) string {
 		name = name[:64]
 	}
 	return name
+}
+
+// injectMetaAWSRegion は JSON-RPC リクエストボディの params._meta.AWS_REGION に region を注入する。
+// AWS MCP Server の call_aws 等 API ツールは _meta.AWS_REGION が必須。
+// mcp-proxy-for-aws の sigv4_helper.py の _inject_metadata_hook と同じ動作。
+func injectMetaAWSRegion(r *http.Request, region string) *http.Request {
+	if r.Body == nil || r.Body == http.NoBody || r.ContentLength == 0 {
+		return r
+	}
+	body, err := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	if err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return r
+	}
+
+	var rpc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rpc); err != nil || rpc["jsonrpc"] == nil {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return r
+	}
+
+	var params map[string]json.RawMessage
+	if raw, ok := rpc["params"]; ok {
+		_ = json.Unmarshal(raw, &params)
+	}
+	if params == nil {
+		params = make(map[string]json.RawMessage)
+	}
+
+	var meta map[string]json.RawMessage
+	if raw, ok := params["_meta"]; ok {
+		_ = json.Unmarshal(raw, &meta)
+	}
+	if meta == nil {
+		meta = make(map[string]json.RawMessage)
+	}
+
+	// クライアントが明示した値を優先し、未設定時のみ注入する
+	if _, ok := meta["AWS_REGION"]; !ok {
+		meta["AWS_REGION"], _ = json.Marshal(region)
+	}
+
+	params["_meta"], _ = json.Marshal(meta)
+	rpc["params"], _ = json.Marshal(params)
+	newBody, err := json.Marshal(rpc)
+	if err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return r
+	}
+
+	r2 := r.Clone(r.Context())
+	r2.Body = io.NopCloser(bytes.NewReader(newBody))
+	r2.ContentLength = int64(len(newBody))
+	return r2
 }
 
 // newStore initializes the session store based on the STORE_BACKEND environment variable.
@@ -494,11 +550,11 @@ func main() {
 			}
 
 			federatedProxy := buildProxy(target, federatedTransport, targetAWSRegion)
-			federatedProxy.ServeHTTP(w, r)
+			federatedProxy.ServeHTTP(w, injectMetaAWSRegion(r, targetAWSRegion))
 			return
 		}
 
-		proxy.ServeHTTP(w, r)
+		proxy.ServeHTTP(w, injectMetaAWSRegion(r, targetAWSRegion))
 	})
 
 	http.Handle("/", auth.Wrap(loggingProxy))
