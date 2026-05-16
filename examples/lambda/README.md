@@ -230,6 +230,65 @@ aws dynamodb update-time-to-live \
   --time-to-live-specification "Enabled=true,AttributeName=ttl"
 ```
 
+## Microsoft Entra ID Setup
+
+### 1. Register an application
+
+1. [Azure Portal](https://portal.azure.com) → **Microsoft Entra ID** → **App registrations** → **New registration**
+2. Fill in:
+   - **Name**: `aws-mcp-gateway` (or any name)
+   - **Supported account types**: *Accounts in this organizational directory only*
+   - **Redirect URI**: leave blank for now — set after Function URL is known (Step 6)
+3. Click **Register**
+
+### 2. Collect required values
+
+From the app's **Overview** page:
+
+| SSM parameter | Azure Portal label | Location |
+|---|---|---|
+| `OIDC_CLIENT_ID` | **Application (client) ID** | Overview |
+| `<tenant-id>` in `OIDC_ISSUER` | **Directory (tenant) ID** | Overview |
+
+`OIDC_ISSUER` value:
+```
+https://login.microsoftonline.com/<tenant-id>/v2.0
+```
+
+### 3. Create a client secret
+
+1. Left menu → **Certificates & secrets** → **Client secrets** → **New client secret**
+2. Enter a description and choose an expiry
+3. Click **Add** → copy the **Value** immediately (it disappears on navigation)
+
+This is `OIDC_CLIENT_SECRET`.
+
+### 4. Add API permissions
+
+1. Left menu → **API permissions** → **Add a permission** → **Microsoft Graph** → **Delegated permissions**
+2. Add: `openid`, `email`, `profile`
+3. Click **Grant admin consent for \<your org\>** → **Yes**
+
+All three permissions should show a green checkmark.
+
+### 5. Add optional claims to the ID token
+
+1. Left menu → **Token configuration** → **Add optional claim**
+2. **Token type**: `ID`
+3. Check **`email`** → **Add**
+
+> **Note:** `name` (display name) is included automatically when the `profile` scope is granted. `family_name` and `given_name` are not required by aws-mcp-gateway.
+
+### 6. Set redirect URI (after Function URL is known)
+
+After the initial Lambda deploy (Step 6 in Deploy), add the redirect URI:
+
+1. Left menu → **Authentication** → **Add a platform** → **Web**
+2. **Redirect URI**: `https://<function-url-id>.lambda-url.ap-northeast-1.on.aws/auth/callback`
+3. Click **Configure**
+
+---
+
 ## SSM Parameter Store Setup
 
 ```bash
