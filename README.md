@@ -186,9 +186,13 @@ aws iam put-role-policy \
 
 ---
 
-### Pattern 3: No Delete (Deny Destructive Actions)
+### Pattern 3: No Delete
 
-Full MCP access but explicitly denies destructive operations. The Deny has no MCP condition — it blocks deletion regardless of how the call arrives.
+> ⚠️ **Important:** A deny-list approach cannot reliably prevent all destructive actions. Actions like `iam:PassRole`, `iam:PutRolePolicy`, `lambda:UpdateFunctionCode`, and `s3:PutBucketPolicy` can cause significant impact even without explicit delete permissions. For strong prevention in production, use an **SCP (Service Control Policy)** at the AWS Organizations level instead.
+>
+> Use this pattern only as a supplementary control in non-critical environments.
+
+Full MCP access with common delete actions explicitly denied. The Deny has no MCP condition — it blocks deletion regardless of call origin.
 
 ```json
 {
@@ -206,7 +210,7 @@ Full MCP access but explicitly denies destructive operations. The Deny has no MC
       }
     },
     {
-      "Sid": "DenyDestructiveActions",
+      "Sid": "DenyCommonDeleteActions",
       "Effect": "Deny",
       "Action": [
         "s3:DeleteBucket", "s3:DeleteObject", "s3:DeleteObjects",
@@ -218,7 +222,16 @@ Full MCP access but explicitly denies destructive operations. The Deny has no MC
         "ecs:DeleteCluster", "ecs:DeleteService",
         "eks:DeleteCluster", "eks:DeleteNodegroup",
         "iam:DeleteRole", "iam:DeletePolicy", "iam:DeleteUser",
-        "cloudformation:DeleteStack"
+        "cloudformation:DeleteStack",
+        "secretsmanager:DeleteSecret",
+        "logs:DeleteLogGroup",
+        "ecr:DeleteRepository",
+        "sqs:DeleteQueue",
+        "sns:DeleteTopic",
+        "route53:DeleteHostedZone",
+        "events:DeleteRule",
+        "elasticloadbalancing:DeleteLoadBalancer",
+        "cloudfront:DeleteDistribution"
       ],
       "Resource": "*"
     }
@@ -246,9 +259,11 @@ aws iam put-role-policy \
 
 ---
 
-### Pattern 4: Read-Only + Debug
+### Pattern 4: Operational Investigation
 
-Read-only access plus log querying, tracing, Lambda invocation, and remote shell access for incident investigation. Intended for on-call engineers and SRE workflows.
+> ⚠️ **This pattern grants execution-level permissions**, not read-only. `ssm:SendCommand`, `ecs:ExecuteCommand`, and `lambda:InvokeFunction` can affect running systems. These are essential for incident investigation — use only for trusted on-call engineers and SRE workflows with CloudTrail audit logging enabled.
+
+Read access plus log querying, distributed tracing, Lambda invocation, and remote shell access for incident investigation.
 
 ```json
 {
@@ -326,6 +341,16 @@ Use this as a Service Control Policy (SCP) to completely block all MCP-originate
   ]
 }
 ```
+
+## Security Considerations
+
+### Shared IAM Role
+
+All users who authenticate via OIDC share the same IAM role attached to the gateway runtime. The gateway does not perform per-user IAM authorization — OIDC authentication determines *who can access the gateway*, but IAM controls *what the gateway can do on their behalf*.
+
+This means:
+- Every authenticated user inherits the full permissions of the gateway's IAM role
+- If you need per-user permission boundaries, deploy separate gateway instances with separate roles, or restrict who can authenticate via OIDC (`ALLOWED_EMAILS`, `ALLOWED_DOMAINS` in idproxy)
 
 ## Quick Start
 
