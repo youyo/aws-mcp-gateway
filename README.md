@@ -341,12 +341,148 @@ This means:
 
 ### Audit Traceability
 
-CloudTrail records downstream AWS API calls under the **gateway's IAM role**, not the individual user. This means you cannot distinguish *which user* triggered a specific AWS API call from CloudTrail alone.
+CloudTrail records downstream AWS API calls under the **gateway's IAM role**, not the individual user. You cannot distinguish *which user* triggered a specific AWS API call from CloudTrail alone.
 
-To correlate user identity with AWS actions:
-- Enable access logging in the gateway (OIDC `sub` / email per request)
-- Cross-reference gateway request logs with CloudTrail by timestamp and source IP
-- For Pattern 4 (Operational Investigation), additionally enable SSM session logging and ECS Exec logging
+The strategy is to correlate **gateway access logs** (who called the gateway, with OIDC identity) against **CloudTrail / execution logs** (what AWS actions happened) by timestamp.
+
+---
+
+#### 1. Enable CloudTrail (if not already active)
+
+```bash
+# Create an S3 bucket for CloudTrail logs
+aws s3 mb s3://my-cloudtrail-logs-$(aws sts get-caller-identity --query Account --output text) \
+  --region ap-northeast-1
+
+# Enable CloudTrail in all regions
+aws cloudtrail create-trail \
+  --name aws-mcp-gateway-trail \
+  --s3-bucket-name my-cloudtrail-logs-$(aws sts get-caller-identity --query Account --output text) \
+  --is-multi-region-trail \
+  --include-global-service-events
+
+aws cloudtrail start-logging --name aws-mcp-gateway-trail
+```
+
+---
+
+#### 2. SSM Session Manager — Enable Logging (Pattern 4)
+
+Store all session input/output to CloudWatch Logs for later forensics.
+
+```bash
+# Create CloudWatch Log Group for SSM sessions
+aws logs create-log-group --log-group-name /aws/ssm/sessions
+
+# Apply Session Manager preferences (account-wide)
+aws ssm update-service-setting \
+  --setting-id arn:aws:ssm:ap-northeast-1:$(aws sts get-caller-identity --query Account --output text):servicesetting/ssm/session-manager/cloudwatch-log-group-name \
+  --setting-value /aws/ssm/sessions
+
+aws ssm update-service-setting \
+  --setting-id arn:aws:ssm:ap-northeast-1:$(aws sts get-caller-identity --query Account --output text):servicesetting/ssm/session-manager/cloudwatch-log-upload-enabled \
+  --setting-value true
+```
+
+---
+
+#### 3. ECS Exec — Enable Logging (Pattern 4)
+
+Add `logConfiguration` to your task definition's `linuxParameters.initProcessEnabled` section:
+
+```json
+{
+  "taskDefinition": {
+    "containerDefinitions": [{
+      "name": "your-container",
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/exec-logs",
+          "awslogs-region": "ap-northeast-1",
+          "awslogs-stream-prefix": "exec"
+        }
+      }
+    }],
+    "enableExecuteCommand": true
+  }
+}
+```
+
+```bash
+# Create the log group
+aws logs create-log-group --log-group-name /ecs/exec-logs
+
+# Update your ECS service to enable execute-command
+aws ecs update-service \
+  --cluster my-cluster \
+  --service my-service \
+  --enable-execute-command
+```
+
+---
+
+#### 4. Query Logs — Sample Commands
+
+**Find all AWS API calls made via this gateway (CloudTrail):**
+
+```bash
+# Look up events by the gateway's IAM role in the last hour
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=Username,AttributeValue=aws-mcp-gateway-readonly \
+  --start-time $(date -u -v-1H +%Y-%m-%dT%H:%M:%SZ) \
+  --query 'Events[*].{Time:EventTime,Event:EventName,Source:EventSource}' \
+  --output table
+```
+
+**Find CloudWatch Logs Insights query — correlate by time window:**
+
+```bash
+# Query SSM session logs for commands run in a time window
+aws logs start-query \
+  --log-group-name /aws/ssm/sessions \
+  --start-time $(date -u -v-1H +%s) \
+  --end-time $(date -u +%s) \
+  --query-string 'fields @timestamp, sessionId, target, @message | sort @timestamp desc | limit 50'
+
+# Get results (replace QUERY_ID with the id returned above)
+aws logs get-query-results --query-id QUERY_ID \
+  --query 'results[*][?field==`@message`].value' --output text
+```
+
+**CloudWatch Logs Insights — ECS Exec logs:**
+
+```bash
+aws logs start-query \
+  --log-group-name /ecs/exec-logs \
+  --start-time $(date -u -v-1H +%s) \
+  --end-time $(date -u +%s) \
+  --query-string 'fields @timestamp, container, @message | sort @timestamp desc | limit 50'
+```
+
+**CloudWatch Logs Insights — Lambda invocation logs (Pattern 4):**
+
+```bash
+aws logs start-query \
+  --log-group-name /aws/lambda/your-function-name \
+  --start-time $(date -u -v-1H +%s) \
+  --end-time $(date -u +%s) \
+  --query-string 'fields @timestamp, @requestId, @message | filter @message like /START|END|REPORT/ | sort @timestamp desc'
+```
+
+**Correlate gateway user identity with CloudTrail (cross-reference by time):**
+
+```bash
+# 1. Find gateway access logs around the suspicious time (adjust log source as needed)
+#    Gateway logs contain OIDC email/sub per request
+
+# 2. Query CloudTrail for the same time window with the gateway role
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=Username,AttributeValue=aws-mcp-gateway-debug \
+  --start-time 2026-01-01T10:00:00Z \
+  --end-time 2026-01-01T10:05:00Z \
+  --output json | jq '.Events[] | {time: .EventTime, action: .EventName, resource: .Resources}'
+```
 
 ## Quick Start
 

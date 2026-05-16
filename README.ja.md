@@ -341,12 +341,154 @@ OIDC で認証した全ユーザーは、ゲートウェイランタイムに付
 
 ### 監査追跡性
 
-CloudTrail はダウンストリームの AWS API コールを**個人ユーザーではなくゲートウェイの IAM ロール**として記録します。CloudTrail だけでは「どのユーザーが」特定の AWS API を呼び出したかを特定できません。
+CloudTrail はダウンストリームの AWS API コールを**個人ユーザーではなくゲートウェイの IAM ロール**として記録します。CloudTrail だけでは「誰が」特定の AWS API を呼び出したかを特定できません。
 
-ユーザー ID と AWS 操作を紐づけるには：
-- ゲートウェイのアクセスログにリクエストごとの OIDC `sub` / email を記録する
-- タイムスタンプとソース IP でゲートウェイログと CloudTrail を突き合わせる
-- パターン 4（障害調査）では加えて SSM セッションログ・ECS Exec ログを有効にする
+基本戦略は**ゲートウェイアクセスログ**（誰がいつ呼んだか、OIDC ID 付き）と **CloudTrail / 実行ログ**（どの AWS 操作が発生したか）をタイムスタンプで突き合わせることです。
+
+---
+
+#### 1. CloudTrail の有効化（未設定の場合）
+
+```bash
+# CloudTrail ログ保存用の S3 バケットを作成
+aws s3 mb s3://my-cloudtrail-logs-$(aws sts get-caller-identity --query Account --output text) \
+  --region ap-northeast-1
+
+# マルチリージョン証跡を作成・有効化
+aws cloudtrail create-trail \
+  --name aws-mcp-gateway-trail \
+  --s3-bucket-name my-cloudtrail-logs-$(aws sts get-caller-identity --query Account --output text) \
+  --is-multi-region-trail \
+  --include-global-service-events
+
+aws cloudtrail start-logging --name aws-mcp-gateway-trail
+```
+
+---
+
+#### 2. SSM Session Manager ログの有効化（パターン 4 使用時）
+
+セッションの入出力を CloudWatch Logs に保存します。
+
+```bash
+# SSM セッション用の CloudWatch Logs グループを作成
+aws logs create-log-group --log-group-name /aws/ssm/sessions
+
+# SSM セッションマネージャーのログ設定（アカウント全体に適用）
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+aws ssm update-service-setting \
+  --setting-id arn:aws:ssm:ap-northeast-1:${ACCOUNT_ID}:servicesetting/ssm/session-manager/cloudwatch-log-group-name \
+  --setting-value /aws/ssm/sessions
+
+aws ssm update-service-setting \
+  --setting-id arn:aws:ssm:ap-northeast-1:${ACCOUNT_ID}:servicesetting/ssm/session-manager/cloudwatch-log-upload-enabled \
+  --setting-value true
+```
+
+---
+
+#### 3. ECS Exec ログの有効化（パターン 4 使用時）
+
+タスク定義の `logConfiguration` でコンテナ実行ログを CloudWatch Logs に出力します。
+
+```json
+{
+  "containerDefinitions": [{
+    "name": "your-container",
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "/ecs/exec-logs",
+        "awslogs-region": "ap-northeast-1",
+        "awslogs-stream-prefix": "exec"
+      }
+    }
+  }],
+  "enableExecuteCommand": true
+}
+```
+
+```bash
+# ロググループを作成
+aws logs create-log-group --log-group-name /ecs/exec-logs
+
+# ECS サービスで execute-command を有効化
+aws ecs update-service \
+  --cluster my-cluster \
+  --service my-service \
+  --enable-execute-command
+```
+
+---
+
+#### 4. ログ取得サンプル
+
+**ゲートウェイロール経由の AWS API コールを CloudTrail で確認:**
+
+```bash
+# 直近1時間にゲートウェイロールが行った操作を一覧
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=Username,AttributeValue=aws-mcp-gateway-readonly \
+  --start-time $(date -u -v-1H +%Y-%m-%dT%H:%M:%SZ) \
+  --query 'Events[*].{Time:EventTime,Event:EventName,Source:EventSource}' \
+  --output table
+```
+
+**SSM セッションログを CloudWatch Logs Insights でクエリ:**
+
+```bash
+# クエリを開始（直近1時間のセッションログ）
+QUERY_ID=$(aws logs start-query \
+  --log-group-name /aws/ssm/sessions \
+  --start-time $(date -u -v-1H +%s) \
+  --end-time $(date -u +%s) \
+  --query-string 'fields @timestamp, sessionId, target, @message | sort @timestamp desc | limit 50' \
+  --query 'queryId' --output text)
+
+# 結果を取得
+aws logs get-query-results --query-id ${QUERY_ID} --output json
+```
+
+**ECS Exec ログをクエリ:**
+
+```bash
+QUERY_ID=$(aws logs start-query \
+  --log-group-name /ecs/exec-logs \
+  --start-time $(date -u -v-1H +%s) \
+  --end-time $(date -u +%s) \
+  --query-string 'fields @timestamp, container, @message | sort @timestamp desc | limit 50' \
+  --query 'queryId' --output text)
+
+aws logs get-query-results --query-id ${QUERY_ID} --output json
+```
+
+**Lambda 呼び出しログをクエリ（パターン 4）:**
+
+```bash
+QUERY_ID=$(aws logs start-query \
+  --log-group-name /aws/lambda/your-function-name \
+  --start-time $(date -u -v-1H +%s) \
+  --end-time $(date -u +%s) \
+  --query-string 'fields @timestamp, @requestId, @message | filter @message like /START|END|REPORT/ | sort @timestamp desc' \
+  --query 'queryId' --output text)
+
+aws logs get-query-results --query-id ${QUERY_ID} --output json
+```
+
+**ゲートウェイログと CloudTrail の突き合わせ（時刻による相関）:**
+
+```bash
+# 1. ゲートウェイのアクセスログから不審な時刻を特定
+#    （ゲートウェイのログに OIDC email/sub が含まれる）
+
+# 2. その時刻前後の CloudTrail イベントをゲートウェイロールで絞り込む
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=Username,AttributeValue=aws-mcp-gateway-debug \
+  --start-time 2026-01-01T10:00:00Z \
+  --end-time 2026-01-01T10:05:00Z \
+  --output json | jq '.Events[] | {time: .EventTime, action: .EventName, resource: .Resources}'
+```
 
 ## クイックスタート
 
