@@ -93,7 +93,12 @@ Safe for read-only exploration — describe, list, and get operations only.
         "*:Lookup*",
         "*:BatchGet*"
       ],
-      "Resource": "*"
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:CalledViaFirst": "mcp.amazonaws.com"
+        }
+      }
     }
   ]
 }
@@ -131,7 +136,12 @@ Full access to all AWS services. Use only in sandbox or personal accounts.
     {
       "Effect": "Allow",
       "Action": "*",
-      "Resource": "*"
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:CalledViaFirst": "mcp.amazonaws.com"
+        }
+      }
     }
   ]
 }
@@ -156,7 +166,12 @@ Full access except for delete, terminate, and remove operations. Suitable for st
     {
       "Effect": "Allow",
       "Action": "*",
-      "Resource": "*"
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:CalledViaFirst": "mcp.amazonaws.com"
+        }
+      }
     },
     {
       "Effect": "Deny",
@@ -236,7 +251,12 @@ Read-only access plus the ability to query logs, traces, and invoke Lambda for i
         "ssm:SendCommand",
         "ecs:ExecuteCommand"
       ],
-      "Resource": "*"
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:CalledViaFirst": "mcp.amazonaws.com"
+        }
+      }
     }
   ]
 }
