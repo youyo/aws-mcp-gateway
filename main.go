@@ -70,7 +70,7 @@ func newSigV4RoundTripper(ctx context.Context, region, service string) (*sigV4Ro
 	// If ASSUME_ROLE_ARN is set, assume the specified role before signing requests.
 	// Useful when the runtime role (Lambda execution role, etc.) needs to access
 	// a different AWS account or a role with narrower permissions.
-	if assumeRoleARN := os.Getenv("ASSUME_ROLE_ARN"); assumeRoleARN != "" {
+	if assumeRoleARN := strings.TrimSpace(os.Getenv("ASSUME_ROLE_ARN")); assumeRoleARN != "" {
 		stsClient := sts.NewFromConfig(cfg)
 		provider := stscreds.NewAssumeRoleProvider(stsClient, assumeRoleARN, func(o *stscreds.AssumeRoleOptions) {
 			o.RoleSessionName = "aws-mcp-gateway"

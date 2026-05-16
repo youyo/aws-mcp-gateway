@@ -183,6 +183,57 @@ echo "Table ${INSTANCE_NAME} deletion requested."
 
 # ── Convenience ───────────────────────────────────────────────────────────────
 
+[tasks."ssm:init"]
+description = "Create required SSM parameters (fill in OIDC values manually after)"
+run = """
+echo "Creating SSM parameters for INSTANCE_NAME=${INSTANCE_NAME} in ${AWS_REGION}..."
+
+# Placeholder — update to real Function URL after deploy:setup-url
+aws ssm put-parameter --region "${AWS_REGION}" --type SecureString \
+  --name "/${INSTANCE_NAME}/EXTERNAL_URL" --value "https://placeholder.invalid" \
+  --overwrite 2>/dev/null || \
+aws ssm put-parameter --region "${AWS_REGION}" --type SecureString \
+  --name "/${INSTANCE_NAME}/EXTERNAL_URL" --value "https://placeholder.invalid"
+
+# ASSUME_ROLE_ARN: space = disabled (TrimSpace in app treats it as empty)
+aws ssm put-parameter --region "${AWS_REGION}" --type String \
+  --name "/${INSTANCE_NAME}/ASSUME_ROLE_ARN" --value " " \
+  --overwrite 2>/dev/null || \
+aws ssm put-parameter --region "${AWS_REGION}" --type String \
+  --name "/${INSTANCE_NAME}/ASSUME_ROLE_ARN" --value " "
+
+aws ssm put-parameter --region "${AWS_REGION}" --type String \
+  --name "/${INSTANCE_NAME}/DYNAMODB_TABLE" --value "${INSTANCE_NAME}" \
+  --overwrite 2>/dev/null || \
+aws ssm put-parameter --region "${AWS_REGION}" --type String \
+  --name "/${INSTANCE_NAME}/DYNAMODB_TABLE" --value "${INSTANCE_NAME}"
+
+aws ssm put-parameter --region "${AWS_REGION}" --type String \
+  --name "/${INSTANCE_NAME}/DYNAMODB_REGION" --value "${AWS_REGION}" \
+  --overwrite 2>/dev/null || \
+aws ssm put-parameter --region "${AWS_REGION}" --type String \
+  --name "/${INSTANCE_NAME}/DYNAMODB_REGION" --value "${AWS_REGION}"
+
+aws ssm put-parameter --region "${AWS_REGION}" --type String \
+  --name "/${INSTANCE_NAME}/AWS_MCP_REGION" --value "us-east-1" \
+  --overwrite 2>/dev/null || \
+aws ssm put-parameter --region "${AWS_REGION}" --type String \
+  --name "/${INSTANCE_NAME}/AWS_MCP_REGION" --value "us-east-1"
+
+aws ssm put-parameter --region "${AWS_REGION}" --type String \
+  --name "/${INSTANCE_NAME}/TARGET_AWS_REGION" --value "${AWS_REGION}" \
+  --overwrite 2>/dev/null || \
+aws ssm put-parameter --region "${AWS_REGION}" --type String \
+  --name "/${INSTANCE_NAME}/TARGET_AWS_REGION" --value "${AWS_REGION}"
+
+echo ""
+echo "Done. Set these manually in AWS Console or SSM:"
+echo "  /${INSTANCE_NAME}/OIDC_ISSUER      (e.g. https://login.microsoftonline.com/<tenant-id>/v2.0)"
+echo "  /${INSTANCE_NAME}/OIDC_CLIENT_ID"
+echo "  /${INSTANCE_NAME}/OIDC_CLIENT_SECRET"
+echo "  /${INSTANCE_NAME}/COOKIE_SECRET    (run: openssl rand -hex 32)"
+"""
+
 [tasks.setup]
 description = "One-time infrastructure setup: IAM role + DynamoDB (then set ROLE_ARN in .env)"
 depends = ["iam:create", "dynamodb:create"]
