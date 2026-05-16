@@ -1,5 +1,5 @@
 {
-  "FunctionName": "aws-mcp-gateway",
+  "FunctionName": "{{ must_env `INSTANCE_NAME` }}",
   "Description": "OIDC-authenticated reverse proxy for AWS MCP Server",
   "Runtime": "provided.al2023",
   "Handler": "bootstrap",
@@ -12,18 +12,18 @@
   ],
   "Environment": {
     "Variables": {
-      "EXTERNAL_URL":        "{{ ssm `/aws-mcp-gateway/EXTERNAL_URL` }}",
-      "OIDC_ISSUER":         "{{ ssm `/aws-mcp-gateway/OIDC_ISSUER` }}",
-      "OIDC_CLIENT_ID":      "{{ ssm `/aws-mcp-gateway/OIDC_CLIENT_ID` }}",
-      "OIDC_CLIENT_SECRET":  "{{ ssm `/aws-mcp-gateway/OIDC_CLIENT_SECRET` }}",
-      "COOKIE_SECRET":       "{{ ssm `/aws-mcp-gateway/COOKIE_SECRET` }}",
-      "AWS_MCP_REGION":      "{{ ssm `/aws-mcp-gateway/AWS_MCP_REGION` }}",
-      "TARGET_AWS_REGION":   "{{ ssm `/aws-mcp-gateway/TARGET_AWS_REGION` }}",
+      "EXTERNAL_URL":        "{{ ssm (printf `/%s/EXTERNAL_URL`       (must_env `INSTANCE_NAME`)) }}",
+      "OIDC_ISSUER":         "{{ ssm (printf `/%s/OIDC_ISSUER`        (must_env `INSTANCE_NAME`)) }}",
+      "OIDC_CLIENT_ID":      "{{ ssm (printf `/%s/OIDC_CLIENT_ID`     (must_env `INSTANCE_NAME`)) }}",
+      "OIDC_CLIENT_SECRET":  "{{ ssm (printf `/%s/OIDC_CLIENT_SECRET` (must_env `INSTANCE_NAME`)) }}",
+      "COOKIE_SECRET":       "{{ ssm (printf `/%s/COOKIE_SECRET`      (must_env `INSTANCE_NAME`)) }}",
+      "AWS_MCP_REGION":      "{{ ssm (printf `/%s/AWS_MCP_REGION`     (must_env `INSTANCE_NAME`)) }}",
+      "TARGET_AWS_REGION":   "{{ ssm (printf `/%s/TARGET_AWS_REGION`  (must_env `INSTANCE_NAME`)) }}",
       "AWS_LWA_INVOKE_MODE": "response_stream",
-      "ASSUME_ROLE_ARN":     "{{ ssm `/aws-mcp-gateway/ASSUME_ROLE_ARN` }}",
+      "ASSUME_ROLE_ARN":     "{{ ssm (printf `/%s/ASSUME_ROLE_ARN`    (must_env `INSTANCE_NAME`)) }}",
       "STORE_BACKEND":       "dynamodb",
-      "DYNAMODB_TABLE":      "{{ ssm `/aws-mcp-gateway/DYNAMODB_TABLE` }}",
-      "DYNAMODB_REGION":     "{{ ssm `/aws-mcp-gateway/DYNAMODB_REGION` }}"
+      "DYNAMODB_TABLE":      "{{ ssm (printf `/%s/DYNAMODB_TABLE`     (must_env `INSTANCE_NAME`)) }}",
+      "DYNAMODB_REGION":     "{{ ssm (printf `/%s/DYNAMODB_REGION`    (must_env `INSTANCE_NAME`)) }}"
     }
   }
 }

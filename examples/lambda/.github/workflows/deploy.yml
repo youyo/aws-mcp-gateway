@@ -19,6 +19,7 @@ jobs:
     env:
       LAMBDA_ARCH: arm64
       AWS_REGION: ap-northeast-1
+      INSTANCE_NAME: ${{ vars.INSTANCE_NAME }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -58,6 +59,7 @@ jobs:
         env:
           ROLE_ARN: ${{ vars.LAMBDA_ROLE_ARN }}
         run: |
+          test -n "$INSTANCE_NAME" || { echo "INSTANCE_NAME (vars.INSTANCE_NAME) is required"; exit 1; }
           lambroll deploy \
             --function examples/lambda/function.json \
             --function-url examples/lambda/function_url.json \
