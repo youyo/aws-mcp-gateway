@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -110,6 +111,85 @@ func (t *sigV4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	}
 
 	return t.base.RoundTrip(req)
+}
+
+// federatedCredsCache はユーザーごとの CredentialsCache をキャッシュする。
+// キー: "sub::tokenFingerprint"（8桁の sha256 hex）
+// 同一トークンに対してリクエストごとに STS を呼ぶことを防ぐ。
+var federatedCredsCache sync.Map
+
+// tokenFingerprint は ID Token の sha256 上位 4 バイトを hex 文字列で返す。
+// キャッシュキーのトークン同一性チェックに使用する（全文保持を避ける）。
+func tokenFingerprint(idToken string) string {
+	h := sha256.Sum256([]byte(idToken))
+	return hex.EncodeToString(h[:4])
+}
+
+// getFederatedRoundTripper は (sub, idToken) をキーに CredentialsCache をキャッシュし、
+// per-user SigV4 RoundTripper を返す。同一トークンでの二回目以降は STS 呼び出しなし。
+func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idToken, sub string) (*sigV4RoundTripper, error) {
+	cacheKey := sub + "::" + tokenFingerprint(idToken)
+
+	if cached, ok := federatedCredsCache.Load(cacheKey); ok {
+		creds := cached.(*aws.CredentialsCache)
+		return &sigV4RoundTripper{
+			base:    http.DefaultTransport,
+			signer:  v4.NewSigner(),
+			region:  region,
+			service: service,
+			getCreds: func(ctx context.Context) (aws.Credentials, error) {
+				return creds.Retrieve(ctx)
+			},
+		}, nil
+	}
+
+	baseCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWS config for federated role: %w", err)
+	}
+
+	sessionName := sanitizeSessionName("gw-" + sub)
+	stsClient := sts.NewFromConfig(baseCfg)
+	provider := stscreds.NewWebIdentityRoleProvider(stsClient, roleARN, staticTokenRetriever(idToken),
+		func(o *stscreds.WebIdentityRoleOptions) {
+			o.RoleSessionName = sessionName
+		},
+	)
+	creds := aws.NewCredentialsCache(provider)
+	federatedCredsCache.Store(cacheKey, creds)
+
+	return &sigV4RoundTripper{
+		base:    http.DefaultTransport,
+		signer:  v4.NewSigner(),
+		region:  region,
+		service: service,
+		getCreds: func(ctx context.Context) (aws.Credentials, error) {
+			return creds.Retrieve(ctx)
+		},
+	}, nil
+}
+
+// staticTokenRetriever implements stscreds.IdentityTokenRetriever for an in-memory token.
+type staticTokenRetriever string
+
+func (t staticTokenRetriever) GetIdentityToken() ([]byte, error) {
+	return []byte(t), nil
+}
+
+// sanitizeSessionName removes characters not allowed in STS RoleSessionName and truncates to 64 chars.
+func sanitizeSessionName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '=' || r == ',' || r == '.' || r == '@' || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	name := b.String()
+	if len(name) > 64 {
+		name = name[:64]
+	}
+	return name
 }
 
 // newStore initializes the session store based on the STORE_BACKEND environment variable.
@@ -257,6 +337,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	// IAM_MODE determines how AWS credentials are resolved per request.
+	// "shared" (default): use the runtime role (Lambda/ECS/EC2) or ASSUME_ROLE_ARN.
+	// "federated": use the OIDC ID Token to AssumeRoleWithWebIdentity per authenticated user.
+	iamMode := getEnvOrDefault("IAM_MODE", "shared")
+	federatedRoleARN := os.Getenv("FEDERATED_ROLE_ARN")
+	if iamMode == "federated" && federatedRoleARN == "" {
+		slog.Error("FEDERATED_ROLE_ARN is required when IAM_MODE=federated")
+		os.Exit(1)
+	}
+
+	// StoreIDToken is required in federated mode to obtain the OIDC ID Token per request.
+	storeIDToken := iamMode == "federated"
+
 	authCfg := idproxy.Config{
 		Providers:      []idproxy.OIDCProvider{provider},
 		ExternalURL:    externalURL,
@@ -264,6 +357,7 @@ func main() {
 		Store:          sessionStore,
 		AllowedDomains: parsedDomains,
 		AllowedEmails:  parsedEmails,
+		StoreIDToken:   storeIDToken,
 		OAuth: &idproxy.OAuthConfig{
 			SigningKey: signingKey,
 		},
@@ -287,8 +381,37 @@ func main() {
 				"user_email", user.Email,
 				"user_sub", user.Subject,
 				"remote_addr", r.RemoteAddr,
+				"iam_mode", iamMode,
 			)
 		}
+
+		// federated モードでは IDToken が必須。空の場合は shared role へのフォールバックを防ぐ。
+		// IDToken は StoreIDToken=true + authorization_code フローで取得される。
+		// 欠落時は 500 を返す（fail-closed）。
+		if iamMode == "federated" {
+			userSub := ""
+			if user != nil {
+				userSub = user.Subject
+			}
+			if user == nil || user.IDToken == "" {
+				slog.Error("federated mode requires IDToken but none available",
+					"user_sub", userSub,
+					"hint", "ensure StoreIDToken=true and user authenticated via OIDC browser flow",
+				)
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+				return
+			}
+			federatedTransport, ferr := getFederatedRoundTripper(ctx, mcpRegion, awsMCPService, federatedRoleARN, user.IDToken, user.Subject)
+			if ferr != nil {
+				slog.Error("failed to get federated round tripper", "error", ferr.Error(), "user_sub", user.Subject)
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+				return
+			}
+			federatedProxy := buildProxy(target, federatedTransport, targetAWSRegion)
+			federatedProxy.ServeHTTP(w, r)
+			return
+		}
+
 		proxy.ServeHTTP(w, r)
 	})
 
