@@ -122,9 +122,14 @@ aws iam put-role-policy \
 
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 echo "Role created: ${ROLE_ARN}"
-echo ""
-echo "Add to .env:"
-echo "  ROLE_ARN=${ROLE_ARN}"
+
+# Append ROLE_ARN to .env (create if not exists)
+if grep -q "^ROLE_ARN=" .env 2>/dev/null; then
+  sed -i '' "s|^ROLE_ARN=.*|ROLE_ARN=${ROLE_ARN}|" .env
+else
+  echo "ROLE_ARN=${ROLE_ARN}" >> .env
+fi
+echo "Written to .env: ROLE_ARN=${ROLE_ARN}"
 """
 
 [tasks."iam:delete"]
