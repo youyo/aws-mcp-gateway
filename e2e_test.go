@@ -137,7 +137,7 @@ func TestRealAWSMCPEndpointError(t *testing.T) {
 	t.Setenv("AWS_REGION", "us-east-1")
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 
-	transport, err := newSigV4RoundTripper(context.Background(), "us-east-1", "mcp")
+	transport, err := newSigV4RoundTripper(context.Background(), "us-east-1", awsService)
 	if err != nil {
 		t.Fatalf("RoundTripper 作成失敗: %v", err)
 	}
@@ -146,8 +146,12 @@ func TestRealAWSMCPEndpointError(t *testing.T) {
 	srv := httptest.NewServer(proxy)
 	defer srv.Close()
 
-	resp, err := http.Post(srv.URL+"/mcp", "application/json",
-		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream") // Streamable HTTP 必須ヘッダー
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Logf("接続エラー（DNS/ネットワーク）: %v", err)
 		return

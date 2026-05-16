@@ -30,8 +30,8 @@ import (
 )
 
 const (
-	awsMCPEndpoint = "https://mcp.amazonaws.com"
-	awsService     = "mcp"
+	awsMCPEndpoint = "https://aws-mcp.us-east-1.api.aws/mcp"
+	awsService     = "aws-mcp"
 	listenAddr     = ":8080"
 )
 
@@ -108,6 +108,7 @@ func buildProxy(target *url.URL, transport http.RoundTripper, metadataRegion str
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 			r.Out.Host = target.Host
+			r.Out.URL.Path = target.Path // パスを固定（二重にならないよう）
 			r.Out.Header.Set("x-amz-mcp-metadata-aws_region", metadataRegion)
 		},
 		ModifyResponse: func(resp *http.Response) error {
