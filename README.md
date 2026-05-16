@@ -41,14 +41,14 @@ AWS credentials are resolved automatically from the environment (Lambda executio
 | `EXTERNAL_URL` | Public URL of this gateway | `https://aws-mcp.example.com` |
 | `OIDC_ISSUER` | OIDC Issuer URL | `https://login.microsoftonline.com/{tenant-id}/v2.0` |
 | `OIDC_CLIENT_ID` | OAuth Client ID | `your-client-id` |
+| `OIDC_CLIENT_SECRET` | OAuth Client Secret | `your-client-secret` |
 
 ### Optional
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `OIDC_CLIENT_SECRET` | OAuth Client Secret | **required** |
-| `ALLOWED_DOMAINS` | Comma-separated list of allowed email domains (e.g. `example.com,corp.example.com`). If both `ALLOWED_DOMAINS` and `ALLOWED_EMAILS` are unset, **any user in the OIDC tenant can authenticate** | none (warning logged) |
-| `ALLOWED_EMAILS` | Comma-separated list of allowed email addresses. Combined with `ALLOWED_DOMAINS` (OR logic) | none |
+| `ALLOWED_DOMAINS` | Comma-separated list of allowed email domains (e.g. `example.com,corp.example.com`). If both `ALLOWED_DOMAINS` and `ALLOWED_EMAILS` are unset, **any user in the OIDC tenant can authenticate** (warning logged). | none |
+| `ALLOWED_EMAILS` | Comma-separated list of allowed email addresses. Combined with `ALLOWED_DOMAINS` (OR logic). Case-insensitive. | none |
 | `COOKIE_SECRET` | Cookie encryption key (hex-encoded, 32+ bytes) | Random (sessions lost on restart) |
 | `AWS_MCP_ENDPOINT` | AWS MCP Server endpoint URL (overrides `AWS_MCP_REGION`) | derived from `AWS_MCP_REGION` |
 | `AWS_MCP_REGION` | Region of the AWS MCP Server endpoint | `us-east-1` |
