@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/smithy-go"
 	idproxy "github.com/youyo/idproxy"
 )
 
@@ -300,6 +302,27 @@ func TestErrorHandlerReturnsGenericMessage(t *testing.T) {
 	t.Logf("✓ エラー時の汎用メッセージ確認: %q", bodyStr)
 }
 
+// TestSanitizeSessionName: sanitizeSessionName が STS 許可文字 [\w+=,.@-]+ を正しく通過させることを確認
+func TestSanitizeSessionName(t *testing.T) {
+	cases := []struct {
+		input    string
+		expected string
+	}{
+		{"simple", "simple"},
+		{"gw-alice@example.com", "gw-alice@example.com"},
+		{"gw-alice+tag@example.com", "gw-alice+tag@example.com"}, // '+' は STS 許可文字
+		{"gw-alice sub!<>", "gw-alicesub"},                       // スペース・記号は除去
+	}
+	for _, tc := range cases {
+		got := sanitizeSessionName(tc.input)
+		if got != tc.expected {
+			t.Errorf("sanitizeSessionName(%q) = %q, want %q", tc.input, got, tc.expected)
+		} else {
+			t.Logf("✓ sanitizeSessionName(%q) = %q", tc.input, got)
+		}
+	}
+}
+
 // TestOIDCUserLoggingSkipsWhenNoUser: 未認証リクエストではユーザーログがスキップされることを確認
 func TestOIDCUserLoggingSkipsWhenNoUser(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
@@ -349,6 +372,72 @@ func TestOIDCUserLoggingSkipsWhenNoUser(t *testing.T) {
 		t.Error("ユーザーなしなのにログが実行された")
 	}
 	t.Logf("✓ 未認証リクエストではユーザーログをスキップ（UserFromContext = nil）")
+}
+
+// stubAPIError は smithy.APIError を実装するテスト用スタブ。
+type stubAPIError struct {
+	code, msg string
+}
+
+func (e *stubAPIError) Error() string            { return e.msg }
+func (e *stubAPIError) ErrorCode() string        { return e.code }
+func (e *stubAPIError) ErrorMessage() string     { return e.msg }
+func (e *stubAPIError) ErrorFault() smithy.ErrorFault { return smithy.FaultClient }
+
+// TestClassifyFederatedError: classifyFederatedError の分類ロジックを確認
+func TestClassifyFederatedError(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      error
+		expected federatedErrorClass
+	}{
+		{
+			name:     "nil error → transient",
+			err:      nil,
+			expected: federatedErrTransient,
+		},
+		{
+			name:     "InvalidIdentityToken → invalidToken",
+			err:      &stubAPIError{code: "InvalidIdentityToken", msg: "token invalid"},
+			expected: federatedErrInvalidToken,
+		},
+		{
+			name:     "ExpiredTokenException → invalidToken",
+			err:      &stubAPIError{code: "ExpiredTokenException", msg: "token expired"},
+			expected: federatedErrInvalidToken,
+		},
+		{
+			name:     "ExpiredToken → invalidToken",
+			err:      &stubAPIError{code: "ExpiredToken", msg: "token expired"},
+			expected: federatedErrInvalidToken,
+		},
+		{
+			name:     "AccessDenied → forbidden",
+			err:      &stubAPIError{code: "AccessDenied", msg: "access denied"},
+			expected: federatedErrForbidden,
+		},
+		{
+			name:     "Throttling → transient",
+			err:      &stubAPIError{code: "Throttling", msg: "throttled"},
+			expected: federatedErrTransient,
+		},
+		{
+			name:     "通常の error（API error でない）→ transient",
+			err:      errors.New("generic error"),
+			expected: federatedErrTransient,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyFederatedError(tc.err)
+			if got != tc.expected {
+				t.Errorf("classifyFederatedError(%v) = %v, want %v", tc.err, got, tc.expected)
+			} else {
+				t.Logf("✓ classifyFederatedError(%v) = %v", tc.err, got)
+			}
+		})
+	}
 }
 
 // TestOIDCUserLoggingWithUser: 認証済みユーザーの email/sub が取得できることを確認
