@@ -194,8 +194,11 @@ func main() {
 	oidcClientSecret := mustEnv("OIDC_CLIENT_SECRET")
 	allowedDomains := os.Getenv("ALLOWED_DOMAINS")
 	allowedEmails := os.Getenv("ALLOWED_EMAILS")
-	if allowedDomains == "" && allowedEmails == "" {
-		slog.Warn("ALLOWED_DOMAINS and ALLOWED_EMAILS are not set — any authenticated user in the OIDC tenant can access the gateway")
+	// Check the parsed result (not the raw strings) to catch whitespace-only values.
+	parsedDomains := splitCSV(allowedDomains)
+	parsedEmails := splitCSV(allowedEmails)
+	if len(parsedDomains) == 0 && len(parsedEmails) == 0 {
+		slog.Warn("ALLOWED_DOMAINS and ALLOWED_EMAILS are both empty — ANY authenticated user in the OIDC tenant can access the gateway. Set at least one to restrict access.")
 	}
 
 	cookieSecretHex := os.Getenv("COOKIE_SECRET")
@@ -259,8 +262,8 @@ func main() {
 		ExternalURL:    externalURL,
 		CookieSecret:   cookieSecret,
 		Store:          sessionStore,
-		AllowedDomains: splitCSV(allowedDomains),
-		AllowedEmails:  splitCSV(allowedEmails),
+		AllowedDomains: parsedDomains,
+		AllowedEmails:  parsedEmails,
 		OAuth: &idproxy.OAuthConfig{
 			SigningKey: signingKey,
 		},
