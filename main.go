@@ -159,40 +159,64 @@ func tokenFingerprint(idToken string) string {
 
 // getFederatedRoundTripper は (sub, idToken) をキーに CredentialsCache をキャッシュし、
 // per-user SigV4 RoundTripper を返す。同一トークンでの二回目以降は STS 呼び出しなし。
+//
+// ASSUME_ROLE_ARN が設定されている場合はロールチェーンを構成する:
+//   OIDC IDToken → FEDERATED_ROLE_ARN (AssumeRoleWithWebIdentity) → ASSUME_ROLE_ARN (AssumeRole)
+// ユーザー別の CloudTrail 追跡（RoleSessionName = gw-{sub}）は FEDERATED_ROLE_ARN の
+// セッション名で引き続き機能する。
 func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idToken, sub string) (*sigV4RoundTripper, error) {
 	cacheKey := sub + "::" + tokenFingerprint(idToken)
+	// sessionName はキャッシュヒット・ミス両パスで共通して使用する
+	sessionName := sanitizeSessionName("gw-" + sub)
+
+	var creds *aws.CredentialsCache
 
 	if cached, ok := federatedCredsCache.Load(cacheKey); ok {
-		creds := cached.(*aws.CredentialsCache)
-		return makeFederatedRoundTripper(creds, cacheKey, region, service), nil
-	}
+		creds = cached.(*aws.CredentialsCache)
+	} else {
+		// cache miss: 同一 sub の古いトークン fingerprint エントリを削除（メモリリーク防止）
+		oldPrefix := sub + "::"
+		federatedCredsCache.Range(func(k, _ interface{}) bool {
+			if ks, ok := k.(string); ok && strings.HasPrefix(ks, oldPrefix) && ks != cacheKey {
+				evictFederatedEntry(ks)
+			}
+			return true
+		})
 
-	// cache miss: 同一 sub の古いトークン fingerprint エントリを削除（メモリリーク防止）
-	oldPrefix := sub + "::"
-	federatedCredsCache.Range(func(k, _ interface{}) bool {
-		if ks, ok := k.(string); ok && strings.HasPrefix(ks, oldPrefix) && ks != cacheKey {
-			evictFederatedEntry(ks)
+		baseCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+		if err != nil {
+			return nil, fmt.Errorf("failed to load AWS config for federated role: %w", err)
 		}
-		return true
-	})
 
-	baseCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
-	if err != nil {
-		return nil, fmt.Errorf("failed to load AWS config for federated role: %w", err)
+		stsClient := sts.NewFromConfig(baseCfg)
+		provider := stscreds.NewWebIdentityRoleProvider(stsClient, roleARN, staticTokenRetriever(idToken),
+			func(o *stscreds.WebIdentityRoleOptions) {
+				o.RoleSessionName = sessionName
+			},
+		)
+		newCreds := aws.NewCredentialsCache(provider)
+		// LoadOrStore で thundering herd を緩和: 並列リクエストが同時に到達した場合、
+		// 先にストアされたエントリを使い、重複ストアを防ぐ。
+		actual, _ := federatedCredsCache.LoadOrStore(cacheKey, newCreds)
+		creds = actual.(*aws.CredentialsCache)
 	}
 
-	sessionName := sanitizeSessionName("gw-" + sub)
-	stsClient := sts.NewFromConfig(baseCfg)
-	provider := stscreds.NewWebIdentityRoleProvider(stsClient, roleARN, staticTokenRetriever(idToken),
-		func(o *stscreds.WebIdentityRoleOptions) {
-			o.RoleSessionName = sessionName
-		},
-	)
-	newCreds := aws.NewCredentialsCache(provider)
-	// LoadOrStore で thundering herd を緩和: 並列リクエストが同時に到達した場合、
-	// 先にストアされたエントリを使い、重複ストアを防ぐ。
-	actual, _ := federatedCredsCache.LoadOrStore(cacheKey, newCreds)
-	creds := actual.(*aws.CredentialsCache)
+	// ASSUME_ROLE_ARN が設定されている場合、federated credentials の上に AssumeRole を重ねる。
+	// キャッシュヒット・ミスの両パスで適用し、一貫したロールチェーンを保証する。
+	if assumeRoleARN := strings.TrimSpace(os.Getenv("ASSUME_ROLE_ARN")); assumeRoleARN != "" {
+		chainCfg, err := config.LoadDefaultConfig(ctx,
+			config.WithRegion(region),
+			config.WithCredentialsProvider(creds),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load AWS config for role chaining: %w", err)
+		}
+		chainSTS := sts.NewFromConfig(chainCfg)
+		chainProvider := stscreds.NewAssumeRoleProvider(chainSTS, assumeRoleARN, func(o *stscreds.AssumeRoleOptions) {
+			o.RoleSessionName = sessionName // CloudTrail 追跡用に同じセッション名を維持
+		})
+		creds = aws.NewCredentialsCache(chainProvider)
+	}
 
 	return makeFederatedRoundTripper(creds, cacheKey, region, service), nil
 }

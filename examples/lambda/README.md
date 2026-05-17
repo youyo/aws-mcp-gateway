@@ -223,6 +223,18 @@ aws ssm put-parameter --region $REGION --type String \
   --overwrite
 ```
 
+### federated モードとの組み合わせ
+
+`IAM_MODE=federated` と `ASSUME_ROLE_ARN` を同時に設定すると、ロールチェーンが構成されます：
+
+1. ユーザーの OIDC ID Token → `FEDERATED_ROLE_ARN` を `AssumeRoleWithWebIdentity` で assume
+2. 取得した一時認証情報 → `ASSUME_ROLE_ARN` を `AssumeRole` で assume（クロスアカウント等）
+
+これにより、ユーザー別の CloudTrail 追跡（`FEDERATED_ROLE_ARN` のセッション名）を維持しつつ、
+別アカウントのリソースへアクセスできます。
+
+> **注意**: AWS のロールチェーンは最大セッション時間が 1 時間に制限されます。
+
 ## DynamoDB Setup (required for Lambda)
 
 Lambda cold starts reset in-memory state. DynamoDB provides persistent sessions across invocations.
