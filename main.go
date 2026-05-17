@@ -102,15 +102,6 @@ func (t *sigV4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
-	// デバッグ: 送信ボディを一時ログ出力
-	if len(bodyBytes) > 0 {
-		dbg := string(bodyBytes)
-		if len(dbg) > 500 {
-			dbg = dbg[:500] + "..."
-		}
-		slog.Info("sigv4 request body", "body", dbg)
-	}
-
 	hash := sha256.Sum256(bodyBytes)
 	payloadHash := fmt.Sprintf("%x", hash)
 
@@ -350,22 +341,11 @@ func buildProxy(target *url.URL, transport http.RoundTripper, targetAWSRegion st
 			r.Out.Header.Del("Cookie")
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			// デバッグ: レスポンスボディを一時読み取りしてログ出力（call_aws 問題調査用）
-			body, err := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			if err == nil {
-				resp.Body = io.NopCloser(bytes.NewReader(body))
-				bodyStr := string(body)
-				if len(bodyStr) > 500 {
-					bodyStr = bodyStr[:500] + "..."
-				}
-				slog.Info("upstream response",
-					"method", resp.Request.Method,
-					"path", resp.Request.URL.Path,
-					"status", resp.StatusCode,
-					"body", bodyStr,
-				)
-			}
+			slog.Info("upstream response",
+				"method", resp.Request.Method,
+				"path", resp.Request.URL.Path,
+				"status", resp.StatusCode,
+			)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {

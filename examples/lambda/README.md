@@ -14,6 +14,46 @@ aws-mcp-gateway (Lambda Web Adapter)
     └── SigV4 proxy → AWS MCP Server
 ```
 
+## Known Limitations
+
+### `call_aws` and API-execution tools
+
+AWS MCP Server's `call_aws`, `run_script`, and `get_presigned_url` tools require **IAM Identity Center (SSO)-backed sessions**. Lambda execution roles and custom IAM roles — including those assumed via `AssumeRoleWithWebIdentity` — are rejected with `error -32600: Failed to serve request`.
+
+**Knowledge tools work fully through the gateway:**
+
+| Tool | Works via gateway |
+|---|---|
+| `list_regions` | ✅ |
+| `search_documentation` | ✅ |
+| `read_documentation` | ✅ |
+| `recommend` | ✅ |
+| `get_regional_availability` | ✅ |
+| `call_aws` | ❌ Requires SSO session |
+| `run_script` | ❌ Requires SSO session |
+| `get_presigned_url` | ❌ Requires SSO session |
+
+For `call_aws` and other API-execution tools, use [mcp-proxy-for-aws](https://github.com/aws/mcp-proxy-for-aws) locally with your SSO credentials alongside this gateway:
+
+```json
+{
+  "mcpServers": {
+    "aws-mcp-knowledge": {
+      "type": "http",
+      "url": "https://<gateway-url>/mcp"
+    },
+    "aws-mcp-api": {
+      "command": "uvx",
+      "args": ["mcp-proxy-for-aws@latest", "https://aws-mcp.us-east-1.api.aws/mcp",
+               "--metadata", "AWS_REGION=ap-northeast-1"],
+      "env": {"AWS_PROFILE": "your-sso-profile"}
+    }
+  }
+}
+```
+
+---
+
 ## Instance Naming (`INSTANCE_NAME`)
 
 Every resource (Lambda function, DynamoDB table, SSM parameters, IAM roles) is namespaced by `INSTANCE_NAME`. This allows multiple independent deployments within the same AWS account without conflicts.
