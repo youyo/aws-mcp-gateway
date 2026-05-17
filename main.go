@@ -118,9 +118,9 @@ func (t *sigV4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 }
 
 // sigV4HTTPTransport は SigV4 署名リクエスト用の共有 HTTP Transport。
-// mcp-proxy-for-aws に合わせて HTTP/1.1 固定にする（HTTP/2 は無効化）。
-// AWS MCP Server の Streamable HTTP / SSE は HTTP/1.1 を前提としており、
-// HTTP/2 で接続すると call_aws 等の API ツールが -32600 を返す場合がある。
+// http.DefaultTransport を clone して HTTP_PROXY/HTTPS_PROXY 環境変数や
+// TLS 設定を保持しつつ、本番運用向けにタイムアウトと接続プールを設定する。
+// HTTP/1.1 固定: mcp-proxy-for-aws と挙動を揃える（HTTP/2 ネゴシエーション不要）。
 var sigV4HTTPTransport = func() *http.Transport {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.DialContext = (&net.Dialer{
@@ -131,7 +131,7 @@ var sigV4HTTPTransport = func() *http.Transport {
 	tr.MaxIdleConnsPerHost = 20
 	tr.IdleConnTimeout = 90 * time.Second
 	tr.TLSHandshakeTimeout = 10 * time.Second
-	tr.ResponseHeaderTimeout = 30 * time.Second
+	tr.ResponseHeaderTimeout = 60 * time.Second
 	// HTTP/1.1 固定: mcp-proxy-for-aws と同じ transport 設定
 	tr.ForceAttemptHTTP2 = false
 	tr.TLSClientConfig = tr.TLSClientConfig.Clone()
@@ -339,8 +339,7 @@ func buildProxy(target *url.URL, transport http.RoundTripper, targetAWSRegion st
 			r.SetURL(target)
 			r.Out.Host = target.Host
 			r.Out.URL.Path = target.Path
-			// mcp-proxy-for-aws と同じ Accept ヘッダーを設定する。
-			// x-amz-mcp-metadata-aws_region は AWS MCP Server が -32600 を返す原因となるため送らない。
+			// Streamable HTTP に必要な Accept ヘッダーを設定する。
 			r.Out.Header.Set("Accept", "application/json, text/event-stream")
 			// Remove session cookies — they must not be forwarded to the upstream AWS MCP Server.
 			r.Out.Header.Del("Cookie")
