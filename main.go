@@ -478,7 +478,15 @@ func startUpstreamSSE(sessionID string, sess *upstreamSession, endpoint string, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		slog.Warn("GET SSE 非 200 レスポンス", "status", resp.StatusCode, "session_id", sessionID)
+		// 405 のレスポンスボディとヘッダーをデバッグ用にログ出力
+		body, _ := io.ReadAll(resp.Body)
+		slog.Warn("GET SSE 非 200 レスポンス",
+			"status", resp.StatusCode,
+			"session_id", sessionID,
+			"body", string(body),
+			"allow", resp.Header.Get("Allow"),
+			"content-type", resp.Header.Get("Content-Type"),
+		)
 		return
 	}
 
