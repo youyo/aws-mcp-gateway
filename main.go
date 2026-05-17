@@ -118,10 +118,9 @@ func (t *sigV4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 }
 
 // sigV4HTTPTransport は SigV4 署名リクエスト用の共有 HTTP Transport。
-// http.DefaultTransport を clone して HTTP_PROXY/HTTPS_PROXY 環境変数や
-// HTTP/2 サポートを保持しつつ、本番運用向けにタイムアウトと接続プールを設定する。
-// ResponseHeaderTimeout により hung upstream による goroutine leak を防ぐ。
-// SSE / Streamable HTTP は ResponseHeader 受信後にストリームが始まるため両立可能。
+// mcp-proxy-for-aws に合わせて HTTP/1.1 固定にする（HTTP/2 は無効化）。
+// AWS MCP Server の Streamable HTTP / SSE は HTTP/1.1 を前提としており、
+// HTTP/2 で接続すると call_aws 等の API ツールが -32600 を返す場合がある。
 var sigV4HTTPTransport = func() *http.Transport {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.DialContext = (&net.Dialer{
@@ -133,6 +132,10 @@ var sigV4HTTPTransport = func() *http.Transport {
 	tr.IdleConnTimeout = 90 * time.Second
 	tr.TLSHandshakeTimeout = 10 * time.Second
 	tr.ResponseHeaderTimeout = 30 * time.Second
+	// HTTP/1.1 固定: mcp-proxy-for-aws と同じ transport 設定
+	tr.ForceAttemptHTTP2 = false
+	tr.TLSClientConfig = tr.TLSClientConfig.Clone()
+	tr.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	return tr
 }()
 
