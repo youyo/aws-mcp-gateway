@@ -464,7 +464,10 @@ func startUpstreamSSE(sessionID string, sess *upstreamSession, endpoint string, 
 		return
 	}
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("mcp-session-id", sessionID)
+	// mcp-proxy-for-aws が送るプロトコルバージョンヘッダー（サーバーが 2025-06-18 にネゴシエートする）
+	req.Header.Set("mcp-protocol-version", "2025-06-18")
 	req.Header.Set("x-amz-mcp-metadata-aws_region", region)
 
 	resp, err := transport.RoundTrip(req)
