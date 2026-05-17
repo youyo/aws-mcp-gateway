@@ -347,11 +347,61 @@ This means:
 - Every authenticated user inherits the full permissions of the gateway's IAM role
 - If you need per-user permission boundaries, deploy separate gateway instances with separate roles, or restrict who can authenticate via OIDC (`ALLOWED_EMAILS`, `ALLOWED_DOMAINS` in idproxy)
 
+### Federated IAM Mode (`IAM_MODE=federated`)
+
+In federated mode, each authenticated user gets **individual temporary AWS credentials** via `AssumeRoleWithWebIdentity`. The user's OIDC ID Token is passed to STS, which issues session-specific credentials for the `FEDERATED_ROLE_ARN`.
+
+**Benefits:**
+- Per-user CloudTrail attribution: each user's API calls appear under their own session (`gw-<oidc_sub>`)
+- No credential sharing between users
+- Automatic expiry tied to OIDC ID Token lifetime (~1 hour)
+
+**Setup requirements:**
+1. Register the OIDC provider (e.g., Entra ID) as an IAM Identity Provider
+2. Create `FEDERATED_ROLE_ARN` with a trust policy allowing `sts:AssumeRoleWithWebIdentity`
+3. Set `IAM_MODE=federated` and `FEDERATED_ROLE_ARN`
+
+See [Lambda Deployment Example](examples/lambda/README.md#federated-iam-mode-setup) for step-by-step instructions.
+
+### Federated + Cross-Account Access (`IAM_MODE=federated` + `ASSUME_ROLE_ARN`)
+
+Combine federated mode with `ASSUME_ROLE_ARN` for role chaining:
+
+```
+OIDC User → FEDERATED_ROLE_ARN (account A, per-user session) → ASSUME_ROLE_ARN (account B)
+```
+
+This allows per-user CloudTrail attribution while accessing resources in a different AWS account.
+
+**Credential chain:**
+| Step | Operation | Result |
+|------|-----------|--------|
+| 1 | OIDC ID Token → `AssumeRoleWithWebIdentity` | Federated credentials (session: `gw-<sub>`) |
+| 2 | Federated credentials → `AssumeRole` | Target role credentials (session: `gw-<sub>-chain`) |
+
+> ⚠️ **AWS role chaining limit**: Maximum session duration is capped at **1 hour**, regardless of the individual role's `MaxSessionDuration` setting.
+
+### IAM Mode Comparison
+
+| Mode | Credentials | CloudTrail Attribution | Cross-Account |
+|------|------------|----------------------|---------------|
+| `shared` (default) | Shared Lambda execution role | Gateway role only | Via `ASSUME_ROLE_ARN` (all users share) |
+| `federated` | Per-user via OIDC token | Per-user (`gw-<sub>`) | No |
+| `federated` + `ASSUME_ROLE_ARN` | Per-user chain | Per-user (`gw-<sub>`) | Yes |
+
 ### Audit Traceability
 
 CloudTrail records downstream AWS API calls under the **gateway's IAM role**, not the individual user. You cannot distinguish *which user* triggered a specific AWS API call from CloudTrail alone.
 
 The strategy is to correlate **gateway access logs** (who called the gateway, with OIDC identity) against **CloudTrail / execution logs** (what AWS actions happened) by timestamp.
+
+**With `IAM_MODE=federated`**, CloudTrail records each user's calls directly under their own assumed-role session:
+
+```
+arn:aws:sts::<ACCOUNT_ID>:assumed-role/<FEDERATED_ROLE>/gw-<oidc_sub>
+```
+
+No timestamp correlation is needed — you can filter CloudTrail by session name (`gw-<oidc_sub>`) to see exactly which user performed which AWS actions.
 
 ---
 

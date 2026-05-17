@@ -173,6 +173,95 @@ aws iam put-role-policy \
   }'
 ```
 
+## Federated IAM Mode Setup
+
+In federated mode (`IAM_MODE=federated`), each user gets individual temporary AWS credentials using their OIDC ID Token. This provides per-user CloudTrail attribution.
+
+### Architecture
+
+```
+User (Entra ID) → OIDC ID Token → STS AssumeRoleWithWebIdentity → per-user session
+```
+
+### Step 1: Register the OIDC Provider in IAM
+
+```bash
+# Get your OIDC issuer from SSM
+OIDC_ISSUER=$(aws ssm get-parameter --name /${INSTANCE_NAME}/OIDC_ISSUER --with-decryption --query 'Parameter.Value' --output text)
+TENANT_ID=$(echo $OIDC_ISSUER | grep -oE '[0-9a-f-]{36}' | head -1)
+CLIENT_ID=$(aws ssm get-parameter --name /${INSTANCE_NAME}/OIDC_CLIENT_ID --with-decryption --query 'Parameter.Value' --output text)
+
+# Register Entra ID as an OIDC Identity Provider
+aws iam create-open-id-connect-provider \
+  --url "https://login.microsoftonline.com/${TENANT_ID}/v2.0" \
+  --client-id-list "${CLIENT_ID}" \
+  --thumbprint-list "0000000000000000000000000000000000000000"
+```
+
+### Step 2: Create the Federated Role
+
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+aws iam create-role \
+  --role-name ${INSTANCE_NAME}-federated \
+  --assume-role-policy-document "{
+    \"Version\":\"2012-10-17\",
+    \"Statement\":[{
+      \"Effect\":\"Allow\",
+      \"Principal\":{\"Federated\":\"arn:aws:iam::${ACCOUNT_ID}:oidc-provider/login.microsoftonline.com/${TENANT_ID}/v2.0\"},
+      \"Action\":\"sts:AssumeRoleWithWebIdentity\",
+      \"Condition\":{\"StringEquals\":{\"login.microsoftonline.com/${TENANT_ID}/v2.0:aud\":\"${CLIENT_ID}\"}}
+    }]
+  }"
+
+# Attach permissions (ReadOnly example — adjust as needed)
+aws iam attach-role-policy \
+  --role-name ${INSTANCE_NAME}-federated \
+  --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess
+```
+
+### Step 3: Grant Lambda Role permission to AssumeRoleWithWebIdentity
+
+```bash
+aws iam put-role-policy \
+  --role-name ${INSTANCE_NAME}-lambda-role \
+  --policy-name assume-federated \
+  --policy-document "{
+    \"Version\":\"2012-10-17\",
+    \"Statement\":[{
+      \"Effect\":\"Allow\",
+      \"Action\":\"sts:AssumeRoleWithWebIdentity\",
+      \"Resource\":\"arn:aws:iam::${ACCOUNT_ID}:role/${INSTANCE_NAME}-federated\"
+    }]
+  }"
+```
+
+### Step 4: Configure SSM and Deploy
+
+```bash
+aws ssm put-parameter --region $AWS_REGION --type String \
+  --name /${INSTANCE_NAME}/IAM_MODE --value "federated" --overwrite
+
+aws ssm put-parameter --region $AWS_REGION --type String \
+  --name /${INSTANCE_NAME}/FEDERATED_ROLE_ARN \
+  --value "arn:aws:iam::${ACCOUNT_ID}:role/${INSTANCE_NAME}-federated" --overwrite
+```
+
+Then redeploy: `mise run deploy`
+
+### CloudTrail Attribution
+
+With `IAM_MODE=federated`, each user's AWS API calls appear in CloudTrail with their own session name:
+
+```
+arn:aws:sts::<ACCOUNT_ID>:assumed-role/<INSTANCE_NAME>-federated/gw-<oidc_sub>
+```
+
+You can query by user directly — no timestamp correlation needed.
+
+---
+
 ## AssumeRole Setup (optional — for cross-account access)
 
 When `ASSUME_ROLE_ARN` is set, the Lambda execution role assumes the specified target role before signing MCP requests.
@@ -223,17 +312,66 @@ aws ssm put-parameter --region $REGION --type String \
   --overwrite
 ```
 
-### federated モードとの組み合わせ
+### federated モードとの組み合わせ（ロールチェーン）
 
 `IAM_MODE=federated` と `ASSUME_ROLE_ARN` を同時に設定すると、ロールチェーンが構成されます：
 
-1. ユーザーの OIDC ID Token → `FEDERATED_ROLE_ARN` を `AssumeRoleWithWebIdentity` で assume
-2. 取得した一時認証情報 → `ASSUME_ROLE_ARN` を `AssumeRole` で assume（クロスアカウント等）
+**認証フロー:**
+```
+User (OIDC)
+    ↓ AssumeRoleWithWebIdentity (session: gw-<sub>)
+FEDERATED_ROLE_ARN (account A — per-user attribution)
+    ↓ AssumeRole (session: gw-<sub>-chain)
+ASSUME_ROLE_ARN (account B — 別アカウントリソース)
+```
 
-これにより、ユーザー別の CloudTrail 追跡（`FEDERATED_ROLE_ARN` のセッション名）を維持しつつ、
-別アカウントのリソースへアクセスできます。
+**ユースケース:** EntraID で認証したユーザーが、ユーザー別の CloudTrail 追跡を維持しつつ別 AWS アカウントのリソースにアクセスする。
 
-> **注意**: AWS のロールチェーンは最大セッション時間が 1 時間に制限されます。
+**Step 1: FEDERATED_ROLE_ARN に AssumeRole 許可を追加**
+
+```bash
+# FEDERATED_ROLE_ARN が ASSUME_ROLE_ARN を assume できるようにする
+aws iam put-role-policy \
+  --role-name ${INSTANCE_NAME}-federated \
+  --policy-name assume-chain-target \
+  --policy-document "{
+    \"Version\":\"2012-10-17\",
+    \"Statement\":[{
+      \"Effect\":\"Allow\",
+      \"Action\":\"sts:AssumeRole\",
+      \"Resource\":\"arn:aws:iam::<TARGET_ACCOUNT_ID>:role/<TARGET_ROLE_NAME>\"
+    }]
+  }"
+```
+
+**Step 2: ターゲットアカウントのロールに trust policy を追加**
+
+ターゲットアカウントで:
+```bash
+aws iam update-assume-role-policy \
+  --role-name <TARGET_ROLE_NAME> \
+  --policy-document "{
+    \"Version\":\"2012-10-17\",
+    \"Statement\":[{
+      \"Effect\":\"Allow\",
+      \"Principal\":{\"AWS\":\"arn:aws:iam::<ACCOUNT_ID>:role/${INSTANCE_NAME}-federated\"},
+      \"Action\":\"sts:AssumeRole\"
+    }]
+  }"
+```
+
+**Step 3: SSM に ASSUME_ROLE_ARN を設定してデプロイ**
+
+```bash
+aws ssm put-parameter --region $AWS_REGION --type String \
+  --name /${INSTANCE_NAME}/ASSUME_ROLE_ARN \
+  --value "arn:aws:iam::<TARGET_ACCOUNT_ID>:role/<TARGET_ROLE_NAME>" \
+  --overwrite
+
+mise run deploy
+```
+
+> ⚠️ **AWS ロールチェーン制限**: セッション最大時間は **1 時間** に制限されます（各ロールの `MaxSessionDuration` に関わらず）。
 
 ## DynamoDB Setup (required for Lambda)
 
