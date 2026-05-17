@@ -339,10 +339,8 @@ func buildProxy(target *url.URL, transport http.RoundTripper, targetAWSRegion st
 			r.SetURL(target)
 			r.Out.Host = target.Host
 			r.Out.URL.Path = target.Path
-			// mcp-proxy-for-aws はこのカスタムヘッダーを送らない。
-			// サーバーが -32600 を返す原因の一つである可能性があるため一時削除。
-			// r.Out.Header.Set("x-amz-mcp-metadata-aws_region", targetAWSRegion)
 			// mcp-proxy-for-aws と同じ Accept ヘッダーを設定する。
+			// x-amz-mcp-metadata-aws_region は AWS MCP Server が -32600 を返す原因となるため送らない。
 			r.Out.Header.Set("Accept", "application/json, text/event-stream")
 			// Remove session cookies — they must not be forwarded to the upstream AWS MCP Server.
 			r.Out.Header.Del("Cookie")
