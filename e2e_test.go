@@ -717,6 +717,46 @@ func TestGetFederatedRoundTripper_NoAssumeRole(t *testing.T) {
 	}
 }
 
+// TestGetFederatedRoundTripper_CacheHit_ReusesSameCredentials は
+// 同一引数で 2 回呼び出した場合に同一の *aws.CredentialsCache が返ることを確認する。
+// これにより「キャッシュヒット時にチェーンを再構築して毎回 STS を呼ぶ」regression を防ぐ。
+func TestGetFederatedRoundTripper_CacheHit_ReusesSameCredentials(t *testing.T) {
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	federatedCredsCache = sync.Map{}
+	t.Cleanup(func() { federatedCredsCache = sync.Map{} })
+
+	ctx := context.Background()
+	const (
+		region  = "us-east-1"
+		service = "aws-mcp"
+		roleARN = "arn:aws:iam::111:role/Fed"
+		idToken = "test-token"
+		sub     = "sub-test"
+		chained = "arn:aws:iam::222:role/Chain"
+	)
+
+	// 1 回目（cache miss → store）
+	_, _ = getFederatedRoundTripper(ctx, region, service, roleARN, idToken, sub, chained)
+
+	cacheKey := sub + "::" + tokenFingerprint(idToken) + "::" + chained
+	v1, ok1 := federatedCredsCache.Load(cacheKey)
+	if !ok1 {
+		t.Fatal("1回目呼び出し後にキャッシュエントリがない")
+	}
+
+	// 2 回目（cache hit → 同じエントリを返すべき）
+	_, _ = getFederatedRoundTripper(ctx, region, service, roleARN, idToken, sub, chained)
+	v2, ok2 := federatedCredsCache.Load(cacheKey)
+	if !ok2 {
+		t.Fatal("2回目呼び出し後にキャッシュエントリがない")
+	}
+
+	// ポインタ一致確認（同一インスタンス = CredentialsCache が再生成されていない）
+	if v1 != v2 {
+		t.Fatalf("CredentialsCache が再構築された（regression）: 1回目=%p 2回目=%p", v1, v2)
+	}
+}
+
 // TestOIDCUserLoggingWithUser: 認証済みユーザーの email/sub が取得できることを確認
 func TestOIDCUserLoggingWithUser(t *testing.T) {
 	// idproxy.UserFromContext / idproxy.User の動作確認

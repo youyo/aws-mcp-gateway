@@ -169,8 +169,6 @@ func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idT
 	if assumeRoleARN != "" {
 		cacheKey = cacheKey + "::" + assumeRoleARN
 	}
-	// sessionName はキャッシュヒット・ミス両パスで共通して使用する
-	sessionName := sanitizeSessionName("gw-" + sub)
 
 	if cached, ok := federatedCredsCache.Load(cacheKey); ok {
 		creds := cached.(*aws.CredentialsCache)
@@ -193,6 +191,9 @@ func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idT
 		return nil, fmt.Errorf("failed to load AWS config for federated role: %w", err)
 	}
 
+	// cache miss パスのみで sessionName を計算する（キャッシュヒット時は不要な処理をスキップ）
+	sessionName := sanitizeSessionName("gw-" + sub)
+
 	stsClient := sts.NewFromConfig(baseCfg)
 	provider := stscreds.NewWebIdentityRoleProvider(stsClient, roleARN, staticTokenRetriever(idToken),
 		func(o *stscreds.WebIdentityRoleOptions) {
@@ -205,10 +206,11 @@ func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idT
 	// チェーン込みの CredentialsCache をキャッシュするため、キャッシュヒット後は
 	// 追加の STS:AssumeRole 呼び出しが発生しない。
 	if assumeRoleARN != "" {
-		chainSTS := sts.NewFromConfig(aws.Config{
-			Region:      region,
-			Credentials: credsProvider,
-		})
+		// baseCfg を値コピーし Credentials のみ差し替える。
+		// これにより FIPS・DualStack・VPC エンドポイント・Retryer 等の設定が継承される。
+		chainCfg := baseCfg
+		chainCfg.Credentials = credsProvider
+		chainSTS := sts.NewFromConfig(chainCfg)
 		chainProvider := stscreds.NewAssumeRoleProvider(chainSTS, assumeRoleARN, func(o *stscreds.AssumeRoleOptions) {
 			o.RoleSessionName = sanitizeSessionName("gw-" + sub + "-chain")
 		})
