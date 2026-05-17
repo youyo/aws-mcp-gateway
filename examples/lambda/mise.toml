@@ -2,7 +2,7 @@
 # Default values — override in .env or shell environment
 INSTANCE_NAME = "amg"
 AWS_REGION    = "ap-northeast-1"
-VERSION = "0.5.8"
+VERSION = "0.5.9"
 LAMBDA_ARCH   = "arm64"
 # Load secrets from .env (ROLE_ARN etc.)
 _.file = ".env"
