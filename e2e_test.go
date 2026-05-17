@@ -446,59 +446,107 @@ func TestClassifyFederatedError(t *testing.T) {
 // - 既存値の保持（client が明示した値は上書きしない）
 // - 不正形状（_meta が数値、params が文字列）→ 原文を破壊せず返す
 // - JSON-RPC でないボディ → 原文を返す
+// - ContentLength=0 / NoBody → 注入スキップ（ok=true）
+// - params:null → 原文を返す（ok=true）
+// - _meta:null → 空 map として注入（ok=true）
+// - 正常ケースで ok=true
 func TestInjectMetaAWSRegion(t *testing.T) {
 	cases := []struct {
-		name       string
-		body       string
-		region     string
-		wantBody   string // 期待ボディ（"" の場合は body と同一であることを確認）
-		mustEqual  bool   // true: 原文と byte-equal であること
+		name      string
+		body      string
+		region    string
+		wantBody  string // 期待ボディ（"" の場合は body と同一であることを確認）
+		mustEqual bool   // true: 原文と byte-equal であること
+		wantOK    bool
+		noBody    bool // true: ContentLength=0, Body=http.NoBody を使う
 	}{
 		{
 			name:     "_meta なし → AWS_REGION を注入",
 			body:     `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}`,
 			region:   "ap-northeast-1",
 			wantBody: `{"id":1,"jsonrpc":"2.0","method":"tools/call","params":{"_meta":{"AWS_REGION":"ap-northeast-1"}}}`,
+			wantOK:   true,
 		},
 		{
 			name:     "既存 AWS_REGION → 上書きしない",
 			body:     `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"_meta":{"AWS_REGION":"us-west-2"}}}`,
 			region:   "ap-northeast-1",
 			wantBody: `{"id":1,"jsonrpc":"2.0","method":"tools/call","params":{"_meta":{"AWS_REGION":"us-west-2"}}}`,
+			wantOK:   true,
 		},
 		{
 			name:      "_meta が数値 → 原文を返す（破壊しない）",
 			body:      `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"_meta":42}}`,
 			region:    "ap-northeast-1",
 			mustEqual: true,
+			wantOK:    true,
 		},
 		{
 			name:      "params が文字列 → 原文を返す（破壊しない）",
 			body:      `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":"hello"}`,
 			region:    "ap-northeast-1",
 			mustEqual: true,
+			wantOK:    true,
 		},
 		{
 			name:      "JSON-RPC でない（jsonrpc キーなし）→ 原文を返す",
 			body:      `{"foo":"bar"}`,
 			region:    "ap-northeast-1",
 			mustEqual: true,
+			wantOK:    true,
 		},
 		{
 			name:      "不正な JSON → 原文を返す",
 			body:      `not a json`,
 			region:    "ap-northeast-1",
 			mustEqual: true,
+			wantOK:    true,
+		},
+		{
+			name:   "ContentLength=0 / NoBody → 注入スキップ（ok=true）",
+			body:   "",
+			region: "ap-northeast-1",
+			noBody: true,
+			wantOK: true,
+		},
+		{
+			name:      "params:null → 原文を返す（ok=true）",
+			body:      `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":null}`,
+			region:    "ap-northeast-1",
+			mustEqual: true,
+			wantOK:    true,
+		},
+		{
+			name:     "_meta:null → 空 map として注入（ok=true）",
+			body:     `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"_meta":null}}`,
+			region:   "ap-northeast-1",
+			wantBody: `{"id":1,"jsonrpc":"2.0","method":"tools/call","params":{"_meta":{"AWS_REGION":"ap-northeast-1"}}}`,
+			wantOK:   true,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			req, _ := http.NewRequest(http.MethodPost, "http://example.com/", strings.NewReader(tc.body))
-			req.ContentLength = int64(len(tc.body))
+			var req *http.Request
+			if tc.noBody {
+				req, _ = http.NewRequest(http.MethodPost, "http://example.com/", http.NoBody)
+				req.ContentLength = 0
+			} else {
+				req, _ = http.NewRequest(http.MethodPost, "http://example.com/", strings.NewReader(tc.body))
+				req.ContentLength = int64(len(tc.body))
+			}
 			req.Header.Set("Content-Type", "application/json")
 
-			out := injectMetaAWSRegion(req, tc.region)
+			out, ok := injectMetaAWSRegion(req, tc.region)
+			if ok != tc.wantOK {
+				t.Errorf("ok = %v, want %v", ok, tc.wantOK)
+			}
+
+			if tc.noBody {
+				t.Logf("✓ NoBody の場合に ok=%v を返した", ok)
+				return
+			}
+
 			gotBody, err := io.ReadAll(out.Body)
 			if err != nil {
 				t.Fatalf("body 読み取り失敗: %v", err)
@@ -567,57 +615,22 @@ func TestHandleFederatedRequest_IDTokenMissing(t *testing.T) {
 	}
 }
 
-// TestGetOrCreateFederatedProxy: cacheKey が同じなら同一の *httputil.ReverseProxy が返ることを確認する。
-// federated モードのリクエスト毎の buildProxy 呼び出しを排除できていることのテスト。
-func TestGetOrCreateFederatedProxy(t *testing.T) {
-	// 隔離: 既存キャッシュをクリアし、テスト終了後も初期化（テスト順序耐性）。
-	federatedProxyCache = sync.Map{}
-	t.Cleanup(func() { federatedProxyCache = sync.Map{} })
-
-	target, _ := url.Parse("http://upstream.example.invalid/mcp")
-	transport := http.DefaultTransport
-
-	cacheKey := "sub-test::abcd1234"
-	p1 := getOrCreateFederatedProxy(cacheKey, target, transport)
-	p2 := getOrCreateFederatedProxy(cacheKey, target, transport)
-	if p1 != p2 {
-		t.Errorf("同一 cacheKey で異なる proxy が返された (キャッシュ未動作)")
-	} else {
-		t.Logf("✓ 同一 cacheKey で同一 proxy を返した: %p", p1)
-	}
-
-	// evict 後は新しいインスタンスが返ることを確認
-	evictFederatedEntry(cacheKey)
-	p3 := getOrCreateFederatedProxy(cacheKey, target, transport)
-	if p3 == p1 {
-		t.Errorf("evict 後に同じ proxy インスタンスが返された")
-	} else {
-		t.Logf("✓ evict 後に新しい proxy が生成された: %p → %p", p1, p3)
-	}
-}
-
-// TestEvictFederatedEntry: evictFederatedEntry が credentials/proxy 両キャッシュから削除することを確認。
+// TestEvictFederatedEntry: evictFederatedEntry が credentials キャッシュから削除することを確認。
 func TestEvictFederatedEntry(t *testing.T) {
 	federatedCredsCache = sync.Map{}
-	federatedProxyCache = sync.Map{}
 	t.Cleanup(func() {
 		federatedCredsCache = sync.Map{}
-		federatedProxyCache = sync.Map{}
 	})
 
 	cacheKey := "sub-test::deadbeef"
 	federatedCredsCache.Store(cacheKey, "dummy-creds")
-	federatedProxyCache.Store(cacheKey, "dummy-proxy")
 
 	evictFederatedEntry(cacheKey)
 
 	if _, ok := federatedCredsCache.Load(cacheKey); ok {
 		t.Error("credentials cache に残っている")
 	}
-	if _, ok := federatedProxyCache.Load(cacheKey); ok {
-		t.Error("proxy cache に残っている")
-	}
-	t.Logf("✓ evictFederatedEntry が両キャッシュから削除した")
+	t.Logf("✓ evictFederatedEntry が credentials キャッシュから削除した")
 }
 
 // TestOIDCUserLoggingWithUser: 認証済みユーザーの email/sub が取得できることを確認
