@@ -642,7 +642,6 @@ func TestGetFederatedRoundTripper_WithAssumeRole(t *testing.T) {
 	// + 「ASSUME_ROLE_ARN が空のときと戻り値の型が変わらないこと」を確認する。
 	// より深い統合テストは e2e で行う。
 
-	t.Setenv("ASSUME_ROLE_ARN", "arn:aws:iam::123456789012:role/TestRole")
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 
 	// federatedCredsCache をクリーン
@@ -658,6 +657,7 @@ func TestGetFederatedRoundTripper_WithAssumeRole(t *testing.T) {
 		"arn:aws:iam::123456789012:role/FederatedRole",
 		"eyJhbGciOiJSUzI1NiJ9.test-id-token",
 		"test-sub",
+		"arn:aws:iam::123456789012:role/TestRole",
 	)
 	// 認証情報がないためエラーが返ることもあるが、panic しないこと
 	if err == nil {
@@ -666,6 +666,55 @@ func TestGetFederatedRoundTripper_WithAssumeRole(t *testing.T) {
 		}
 	}
 	// ASSUME_ROLE_ARN が設定されている場合でも関数が動作すること
+}
+
+// TestGetFederatedRoundTripper_CacheKeyIncludesAssumeRole は
+// ASSUME_ROLE_ARN が異なる場合に別キャッシュエントリになることを確認。
+func TestGetFederatedRoundTripper_CacheKeyIncludesAssumeRole(t *testing.T) {
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	federatedCredsCache = sync.Map{}
+	t.Cleanup(func() { federatedCredsCache = sync.Map{} })
+
+	ctx := context.Background()
+	// ARN-A と ARN-B で呼び出す → キャッシュに 2 エントリ入ること
+	// (実際の STS は呼ばないのでエラーになるが、panic しないこと)
+	getFederatedRoundTripper(ctx, "us-east-1", "aws-mcp",
+		"arn:aws:iam::111:role/Fed", "token1", "sub1", "arn:aws:iam::111:role/A")
+	getFederatedRoundTripper(ctx, "us-east-1", "aws-mcp",
+		"arn:aws:iam::111:role/Fed", "token1", "sub1", "arn:aws:iam::111:role/B")
+
+	count := 0
+	federatedCredsCache.Range(func(k, _ interface{}) bool { count++; return true })
+	if count != 2 {
+		t.Errorf("expected 2 cache entries for different assumeRoleARN, got %d", count)
+	}
+}
+
+// TestGetFederatedRoundTripper_NoAssumeRole は ASSUME_ROLE_ARN="" のとき
+// キャッシュキーが ASSUME_ROLE_ARN を含まないことを確認（後方互換）。
+func TestGetFederatedRoundTripper_NoAssumeRole(t *testing.T) {
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	federatedCredsCache = sync.Map{}
+	t.Cleanup(func() { federatedCredsCache = sync.Map{} })
+
+	ctx := context.Background()
+	getFederatedRoundTripper(ctx, "us-east-1", "aws-mcp",
+		"arn:aws:iam::111:role/Fed", "token1", "sub1", "")
+
+	found := false
+	federatedCredsCache.Range(func(k, _ interface{}) bool {
+		found = true
+		key := k.(string)
+		// assumeRoleARN="" の場合、キーは "sub::fingerprint" の形式
+		parts := strings.SplitN(key, "::", 3)
+		if len(parts) == 3 && parts[2] != "" {
+			t.Errorf("assumeRoleARN='' なのにキーに ARN が含まれている: %s", key)
+		}
+		return true
+	})
+	if !found {
+		t.Error("キャッシュにエントリが存在しない")
+	}
 }
 
 // TestOIDCUserLoggingWithUser: 認証済みユーザーの email/sub が取得できることを確認
