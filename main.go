@@ -132,8 +132,8 @@ var sigV4HTTPTransport = func() *http.Transport {
 	tr.IdleConnTimeout = 90 * time.Second
 	tr.TLSHandshakeTimeout = 10 * time.Second
 	tr.ResponseHeaderTimeout = 60 * time.Second
-	// HTTP/1.1 固定: mcp-proxy-for-aws と同じ transport 設定
 	tr.ForceAttemptHTTP2 = false
+	// Clone the TLS config to avoid mutating DefaultTransport's shared instance.
 	tr.TLSClientConfig = tr.TLSClientConfig.Clone()
 	tr.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	return tr
@@ -143,6 +143,20 @@ var sigV4HTTPTransport = func() *http.Transport {
 // キー: "sub::tokenFingerprint"（8桁の sha256 hex）
 // 同一トークンに対してリクエストごとに STS を呼ぶことを防ぐ。
 var federatedCredsCache sync.Map
+
+// federatedProxyCache は cacheKey（federatedCredsCache と同じキー）ごとに
+// *httputil.ReverseProxy をキャッシュする。Transport（CredentialsCache 経由）が
+// 同じ間は同一 proxy インスタンスを再利用する。credentials が evict された場合は
+// evictFederatedEntry によって proxy も同時に削除される。
+var federatedProxyCache sync.Map
+
+// evictFederatedEntry は cacheKey に紐づく credentials と proxy のキャッシュを
+// 同時に削除する。permanent な STS エラー時や、同一 sub の古い fingerprint を
+// パージする際に使用する（双方のキャッシュが乖離しないよう一元化）。
+func evictFederatedEntry(cacheKey string) {
+	federatedCredsCache.Delete(cacheKey)
+	federatedProxyCache.Delete(cacheKey)
+}
 
 // tokenFingerprint は ID Token の sha256 上位 4 バイトを hex 文字列で返す。
 // キャッシュキーのトークン同一性チェックに使用する（全文保持を避ける）。
@@ -162,10 +176,11 @@ func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idT
 	}
 
 	// cache miss: 同一 sub の古いトークン fingerprint エントリを削除（メモリリーク防止）
+	// proxy キャッシュも同時に evict する（双方の lifetime を一致させる）。
 	oldPrefix := sub + "::"
 	federatedCredsCache.Range(func(k, _ interface{}) bool {
 		if ks, ok := k.(string); ok && strings.HasPrefix(ks, oldPrefix) && ks != cacheKey {
-			federatedCredsCache.Delete(ks)
+			evictFederatedEntry(ks)
 		}
 		return true
 	})
@@ -203,8 +218,9 @@ func makeFederatedRoundTripper(creds *aws.CredentialsCache, cacheKey, region, se
 			c, err := creds.Retrieve(ctx)
 			if err != nil {
 				// permanent error のみ cache を削除（transient エラーでのキャッシュ thrash 防止）
+				// proxy キャッシュも同時に evict する。
 				if classifyFederatedError(err) != federatedErrTransient {
-					federatedCredsCache.Delete(cacheKey)
+					evictFederatedEntry(cacheKey)
 				}
 				return aws.Credentials{}, err
 			}
@@ -263,6 +279,9 @@ func sanitizeSessionName(s string) string {
 // injectMetaAWSRegion は JSON-RPC リクエストボディの params._meta.AWS_REGION に region を注入する。
 // AWS MCP Server の call_aws 等 API ツールは _meta.AWS_REGION が必須。
 // mcp-proxy-for-aws の sigv4_helper.py の _inject_metadata_hook と同じ動作。
+//
+// 不正な形状（params が object でない、_meta が object でない等）の場合は
+// 原文ボディを破壊せずそのまま返す（fail-safe）。
 func injectMetaAWSRegion(r *http.Request, region string) *http.Request {
 	if r.Body == nil || r.Body == http.NoBody || r.ContentLength == 0 {
 		return r
@@ -274,23 +293,36 @@ func injectMetaAWSRegion(r *http.Request, region string) *http.Request {
 		return r
 	}
 
-	var rpc map[string]json.RawMessage
-	if err := json.Unmarshal(body, &rpc); err != nil || rpc["jsonrpc"] == nil {
+	// 原文ボディを保持して返す共通関数（不正形状時の fail-safe パス）。
+	returnOriginal := func() *http.Request {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		return r
 	}
 
+	var rpc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rpc); err != nil || rpc["jsonrpc"] == nil {
+		return returnOriginal()
+	}
+
+	// params が存在する場合のみ object として解釈を試みる。
+	// params が object でない（string, number, array 等）の場合は原文を返す。
 	var params map[string]json.RawMessage
 	if raw, ok := rpc["params"]; ok {
-		_ = json.Unmarshal(raw, &params)
+		if err := json.Unmarshal(raw, &params); err != nil {
+			return returnOriginal()
+		}
 	}
 	if params == nil {
 		params = make(map[string]json.RawMessage)
 	}
 
+	// _meta が存在する場合のみ object として解釈を試みる。
+	// _meta が object でない（number 等）の場合は原文を返す。
 	var meta map[string]json.RawMessage
 	if raw, ok := params["_meta"]; ok {
-		_ = json.Unmarshal(raw, &meta)
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			return returnOriginal()
+		}
 	}
 	if meta == nil {
 		meta = make(map[string]json.RawMessage)
@@ -298,15 +330,28 @@ func injectMetaAWSRegion(r *http.Request, region string) *http.Request {
 
 	// クライアントが明示した値を優先し、未設定時のみ注入する
 	if _, ok := meta["AWS_REGION"]; !ok {
-		meta["AWS_REGION"], _ = json.Marshal(region)
+		regionJSON, err := json.Marshal(region)
+		if err != nil {
+			return returnOriginal()
+		}
+		meta["AWS_REGION"] = regionJSON
 	}
 
-	params["_meta"], _ = json.Marshal(meta)
-	rpc["params"], _ = json.Marshal(params)
+	metaJSON, err := json.Marshal(meta)
+	if err != nil {
+		return returnOriginal()
+	}
+	params["_meta"] = metaJSON
+
+	paramsJSON, err := json.Marshal(params)
+	if err != nil {
+		return returnOriginal()
+	}
+	rpc["params"] = paramsJSON
+
 	newBody, err := json.Marshal(rpc)
 	if err != nil {
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		return r
+		return returnOriginal()
 	}
 
 	r2 := r.Clone(r.Context())
@@ -331,7 +376,7 @@ func newStore(ctx context.Context) (idproxy.Store, error) {
 	}
 }
 
-func buildProxy(target *url.URL, transport http.RoundTripper, targetAWSRegion string) *httputil.ReverseProxy {
+func buildProxy(target *url.URL, transport http.RoundTripper) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Transport:     transport,
 		FlushInterval: -1, // flush immediately for SSE / Streamable HTTP
@@ -360,6 +405,81 @@ func buildProxy(target *url.URL, transport http.RoundTripper, targetAWSRegion st
 	}
 }
 
+// federatedConfig は federated モード固有の設定値をまとめる。
+// 関数引数の数を抑えるためのバンドル。
+type federatedConfig struct {
+	mcpRegion        string
+	awsMCPService    string
+	federatedRoleARN string
+	targetAWSRegion  string
+	target           *url.URL
+}
+
+// handleFederatedRequest は IAM_MODE=federated の場合のリクエストを処理する。
+//   - IDToken が未取得（user==nil or IDToken=""）の場合は 500 を返す（shared への fallback を防ぐ）。
+//   - per-user の SigV4 transport を取得し、STS エラーを HTTP ステータスへ変換する。
+//   - ReverseProxy は cacheKey ごとに federatedProxyCache でキャッシュし、リクエスト毎の再生成を避ける。
+func handleFederatedRequest(w http.ResponseWriter, r *http.Request, user *idproxy.User, cfg federatedConfig) {
+	userSub := ""
+	if user != nil {
+		userSub = user.Subject
+	}
+	if user == nil || user.IDToken == "" {
+		slog.Error("federated mode requires IDToken but none available",
+			"user_sub", userSub,
+			"hint", "ensure StoreIDToken=true and user authenticated via OIDC browser flow",
+		)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	federatedTransport, ferr := getFederatedRoundTripper(r.Context(), cfg.mcpRegion, cfg.awsMCPService, cfg.federatedRoleARN, user.IDToken, user.Subject)
+	if ferr != nil {
+		slog.Error("failed to get federated round tripper", "error", ferr.Error(), "user_sub", user.Subject)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// 事前 credentials 取得で STS エラーを HTTP ステータスへ変換する。
+	// CredentialsCache が結果をキャッシュするため、proxy 内の再呼び出しは追加 STS コールにならない。
+	if _, cerr := federatedTransport.getCreds(r.Context()); cerr != nil {
+		switch classifyFederatedError(cerr) {
+		case federatedErrInvalidToken:
+			slog.Warn("federated STS rejected ID Token, client should re-authenticate",
+				"error", cerr.Error(), "user_sub", user.Subject)
+			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="OIDC ID Token expired or invalid"`)
+			http.Error(w, "invalid_token", http.StatusUnauthorized)
+		case federatedErrForbidden:
+			slog.Warn("federated STS denied access (role trust policy?)",
+				"error", cerr.Error(), "user_sub", user.Subject)
+			http.Error(w, "forbidden", http.StatusForbidden)
+		default:
+			slog.Error("federated STS transient error",
+				"error", cerr.Error(), "user_sub", user.Subject)
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		}
+		return
+	}
+
+	// transport の cacheKey と一致するキーで proxy をキャッシュする。
+	// credentials が evict されると evictFederatedEntry によって proxy も削除されるため、
+	// stale な transport closure を保持する心配はない。
+	cacheKey := user.Subject + "::" + tokenFingerprint(user.IDToken)
+	proxy := getOrCreateFederatedProxy(cacheKey, cfg.target, federatedTransport)
+	proxy.ServeHTTP(w, injectMetaAWSRegion(r, cfg.targetAWSRegion))
+}
+
+// getOrCreateFederatedProxy は cacheKey に対応する ReverseProxy をキャッシュから取得する。
+// 存在しない場合は buildProxy で生成し、LoadOrStore で thundering herd を緩和する。
+func getOrCreateFederatedProxy(cacheKey string, target *url.URL, transport http.RoundTripper) *httputil.ReverseProxy {
+	if v, ok := federatedProxyCache.Load(cacheKey); ok {
+		return v.(*httputil.ReverseProxy)
+	}
+	p := buildProxy(target, transport)
+	actual, _ := federatedProxyCache.LoadOrStore(cacheKey, p)
+	return actual.(*httputil.ReverseProxy)
+}
+
 func mustEnv(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
@@ -377,7 +497,6 @@ func getEnvOrDefault(key, def string) string {
 }
 
 func main() {
-	// JSON structured logging
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
 	ctx := context.Background()
@@ -423,20 +542,18 @@ func main() {
 		slog.Warn("COOKIE_SECRET not set, using random secret (sessions will be lost on restart)")
 	}
 
-	// SigV4 transport
 	transport, err := newSigV4RoundTripper(ctx, mcpRegion, awsMCPService)
 	if err != nil {
 		slog.Error("failed to create SigV4 round tripper", "error", err.Error())
 		os.Exit(1)
 	}
 
-	// Reverse proxy to AWS MCP Server
 	target, err := url.Parse(mcpEndpoint)
 	if err != nil {
 		slog.Error("invalid AWS MCP endpoint", "endpoint", mcpEndpoint, "error", err.Error())
 		os.Exit(1)
 	}
-	proxy := buildProxy(target, transport, targetAWSRegion)
+	proxy := buildProxy(target, transport)
 
 	// ECDSA signing key for OAuth 2.1 JWT (ephemeral; use a persisted key in production)
 	signingKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -471,9 +588,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// StoreIDToken is required in federated mode to obtain the OIDC ID Token per request.
-	storeIDToken := iamMode == "federated"
-
 	authCfg := idproxy.Config{
 		Providers:      []idproxy.OIDCProvider{provider},
 		ExternalURL:    externalURL,
@@ -481,7 +595,8 @@ func main() {
 		Store:          sessionStore,
 		AllowedDomains: parsedDomains,
 		AllowedEmails:  parsedEmails,
-		StoreIDToken:   storeIDToken,
+		// StoreIDToken is required in federated mode to obtain the OIDC ID Token per request.
+		StoreIDToken: iamMode == "federated",
 		OAuth: &idproxy.OAuthConfig{
 			SigningKey: signingKey,
 		},
@@ -492,6 +607,14 @@ func main() {
 	if err != nil {
 		slog.Error("failed to initialize idproxy", "error", err.Error())
 		os.Exit(1)
+	}
+
+	fedCfg := federatedConfig{
+		mcpRegion:        mcpRegion,
+		awsMCPService:    awsMCPService,
+		federatedRoleARN: federatedRoleARN,
+		targetAWSRegion:  targetAWSRegion,
+		target:           target,
 	}
 
 	// Log OIDC user identity on every authenticated request for audit traceability.
@@ -513,48 +636,7 @@ func main() {
 		// IDToken は StoreIDToken=true + authorization_code フローで取得される。
 		// 欠落時は 500 を返す（fail-closed）。
 		if iamMode == "federated" {
-			userSub := ""
-			if user != nil {
-				userSub = user.Subject
-			}
-			if user == nil || user.IDToken == "" {
-				slog.Error("federated mode requires IDToken but none available",
-					"user_sub", userSub,
-					"hint", "ensure StoreIDToken=true and user authenticated via OIDC browser flow",
-				)
-				http.Error(w, "internal server error", http.StatusInternalServerError)
-				return
-			}
-			federatedTransport, ferr := getFederatedRoundTripper(r.Context(), mcpRegion, awsMCPService, federatedRoleARN, user.IDToken, user.Subject)
-			if ferr != nil {
-				slog.Error("failed to get federated round tripper", "error", ferr.Error(), "user_sub", user.Subject)
-				http.Error(w, "internal server error", http.StatusInternalServerError)
-				return
-			}
-
-			// 事前 credentials 取得で STS エラーを HTTP ステータスへ変換する。
-			// CredentialsCache が結果をキャッシュするため、proxy 内の再呼び出しは追加 STS コールにならない。
-			if _, cerr := federatedTransport.getCreds(r.Context()); cerr != nil {
-				switch classifyFederatedError(cerr) {
-				case federatedErrInvalidToken:
-					slog.Warn("federated STS rejected ID Token, client should re-authenticate",
-						"error", cerr.Error(), "user_sub", user.Subject)
-					w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="OIDC ID Token expired or invalid"`)
-					http.Error(w, "invalid_token", http.StatusUnauthorized)
-				case federatedErrForbidden:
-					slog.Warn("federated STS denied access (role trust policy?)",
-						"error", cerr.Error(), "user_sub", user.Subject)
-					http.Error(w, "forbidden", http.StatusForbidden)
-				default:
-					slog.Error("federated STS transient error",
-						"error", cerr.Error(), "user_sub", user.Subject)
-					http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-				}
-				return
-			}
-
-			federatedProxy := buildProxy(target, federatedTransport, targetAWSRegion)
-			federatedProxy.ServeHTTP(w, injectMetaAWSRegion(r, targetAWSRegion))
+			handleFederatedRequest(w, r, user, fedCfg)
 			return
 		}
 
