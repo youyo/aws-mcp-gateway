@@ -14,7 +14,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/ecdsa"
@@ -53,29 +52,6 @@ const (
 	defaultTargetAWSRegion = "ap-northeast-1"
 	defaultMCPRegion       = "us-east-1"
 )
-
-// ctxKey はコンテキストキーの型。
-type ctxKey int
-
-const (
-	ctxKeyRPCID ctxKey = iota // JSON-RPC id をコンテキストに格納するキー
-)
-
-// pendingRequest は 202 待ちの JSON-RPC リクエスト。
-type pendingRequest struct {
-	respCh chan string
-}
-
-// upstreamSession はセッションごとの GET SSE 接続状態を管理する。
-type upstreamSession struct {
-	pending sync.Map        // JSON-RPC id(string) -> *pendingRequest
-	ready   chan struct{}    // GET SSE 接続が確立したら close される
-	cancel  context.CancelFunc
-}
-
-// activeSessions はアクティブな upstream セッションを管理する。
-// キー: mcp-session-id (string) -> *upstreamSession
-var activeSessions sync.Map
 
 // sigV4RoundTripper signs outbound HTTP requests with AWS SigV4.
 type sigV4RoundTripper struct {
@@ -287,7 +263,6 @@ func sanitizeSessionName(s string) string {
 // injectMetaAWSRegion は JSON-RPC リクエストボディの params._meta.AWS_REGION に region を注入する。
 // AWS MCP Server の call_aws 等 API ツールは _meta.AWS_REGION が必須。
 // mcp-proxy-for-aws の sigv4_helper.py の _inject_metadata_hook と同じ動作。
-// また、JSON-RPC id をコンテキストに格納して ModifyResponse で参照できるようにする。
 func injectMetaAWSRegion(r *http.Request, region string) *http.Request {
 	if r.Body == nil || r.Body == http.NoBody || r.ContentLength == 0 {
 		return r
@@ -334,13 +309,7 @@ func injectMetaAWSRegion(r *http.Request, region string) *http.Request {
 		return r
 	}
 
-	// JSON-RPC id をコンテキストに格納（ModifyResponse で参照するため）
-	ctx := r.Context()
-	if idRaw, ok := rpc["id"]; ok {
-		ctx = context.WithValue(ctx, ctxKeyRPCID, string(idRaw))
-	}
-
-	r2 := r.Clone(ctx)
+	r2 := r.Clone(r.Context())
 	r2.Body = io.NopCloser(bytes.NewReader(newBody))
 	r2.ContentLength = int64(len(newBody))
 	return r2
@@ -363,7 +332,6 @@ func newStore(ctx context.Context) (idproxy.Store, error) {
 }
 
 func buildProxy(target *url.URL, transport http.RoundTripper, targetAWSRegion string) *httputil.ReverseProxy {
-	mcpEndpoint := target.String()
 	return &httputil.ReverseProxy{
 		Transport:     transport,
 		FlushInterval: -1, // flush immediately for SSE / Streamable HTTP
@@ -385,60 +353,6 @@ func buildProxy(target *url.URL, transport http.RoundTripper, targetAWSRegion st
 				"path", resp.Request.URL.Path,
 				"status", resp.StatusCode,
 			)
-
-			sessionID := resp.Header.Get("mcp-session-id")
-
-			// 200 + mcp-session-id: GET SSE チャネルを開始（先にセッションを登録してから goroutine 起動）
-			if resp.StatusCode == http.StatusOK && sessionID != "" {
-				newSess := &upstreamSession{ready: make(chan struct{})}
-				if actual, loaded := activeSessions.LoadOrStore(sessionID, newSess); !loaded {
-					go startUpstreamSSE(sessionID, newSess, mcpEndpoint, transport, targetAWSRegion)
-				} else {
-					// 既存セッションが ready 済みでなければ何もしない（goroutine が既に動いている）
-					_ = actual
-				}
-			}
-
-			// 202: SSE からレスポンスを待って同期的に返す
-			if resp.StatusCode == http.StatusAccepted && sessionID != "" {
-				rpcIDVal := resp.Request.Context().Value(ctxKeyRPCID)
-				if rpcIDVal != nil {
-					rpcID := rpcIDVal.(string)
-					// upstreamSession を取得（まだなければ作成）
-					sessVal, _ := activeSessions.LoadOrStore(sessionID, &upstreamSession{
-						ready: make(chan struct{}),
-					})
-					sess := sessVal.(*upstreamSession)
-
-					pr := &pendingRequest{
-						respCh: make(chan string, 1),
-					}
-					sess.pending.Store(rpcID, pr)
-					defer sess.pending.Delete(rpcID)
-
-					// GET SSE が開くのを待つ
-					select {
-					case <-sess.ready:
-					case <-time.After(10 * time.Second):
-						slog.Warn("GET SSE チャネルが開かれなかった（タイムアウト）", "session_id", sessionID)
-						return nil
-					}
-
-					// SSE からレスポンスを待つ
-					select {
-					case data := <-pr.respCh:
-						// レスポンスを 200 に書き換える
-						resp.StatusCode = http.StatusOK
-						resp.Status = "200 OK"
-						resp.Body = io.NopCloser(strings.NewReader(data))
-						resp.ContentLength = int64(len(data))
-						resp.Header.Set("Content-Type", "application/json")
-					case <-time.After(30 * time.Second):
-						slog.Warn("SSE レスポンスのタイムアウト", "session_id", sessionID, "rpc_id", rpcID)
-					}
-				}
-			}
-
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -447,84 +361,6 @@ func buildProxy(target *url.URL, transport http.RoundTripper, targetAWSRegion st
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 		},
 	}
-}
-
-// startUpstreamSSE は指定セッションの GET SSE チャネルを upstream に開き、
-// SSE イベントを受信して pending request に届ける。
-// sess は呼び出し元が activeSessions.LoadOrStore で登録済みのセッション。
-func startUpstreamSSE(sessionID string, sess *upstreamSession, endpoint string, transport http.RoundTripper, region string) {
-	ctx, cancel := context.WithCancel(context.Background())
-	sess.cancel = cancel
-	defer activeSessions.Delete(sessionID)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		slog.Error("GET SSE リクエスト作成失敗", "error", err.Error())
-		return
-	}
-	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("mcp-session-id", sessionID)
-	// mcp-proxy-for-aws が送るプロトコルバージョンヘッダー（サーバーが 2025-06-18 にネゴシエートする）
-	req.Header.Set("mcp-protocol-version", "2025-06-18")
-	req.Header.Set("x-amz-mcp-metadata-aws_region", region)
-
-	resp, err := transport.RoundTrip(req)
-	if err != nil {
-		slog.Error("GET SSE 接続失敗", "error", err.Error(), "session_id", sessionID)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		// 405 のレスポンスボディとヘッダーをデバッグ用にログ出力
-		body, _ := io.ReadAll(resp.Body)
-		slog.Warn("GET SSE 非 200 レスポンス",
-			"status", resp.StatusCode,
-			"session_id", sessionID,
-			"body", string(body),
-			"allow", resp.Header.Get("Allow"),
-			"content-type", resp.Header.Get("Content-Type"),
-		)
-		return
-	}
-
-	slog.Info("GET SSE チャネル確立", "session_id", sessionID)
-	// ready を通知（待機中の pending request に接続確立を知らせる）
-	close(sess.ready)
-
-	// SSE イベントを読んで pending request に届ける
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 1<<20), 8<<20) // 最大 8MB のイベントに対応
-	var dataLines []string
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "data: ") {
-			dataLines = append(dataLines, strings.TrimPrefix(line, "data: "))
-		} else if line == "" && len(dataLines) > 0 {
-			data := strings.Join(dataLines, "\n")
-			dataLines = nil
-			var msg map[string]json.RawMessage
-			if json.Unmarshal([]byte(data), &msg) == nil {
-				if idRaw, ok := msg["id"]; ok {
-					idStr := string(idRaw)
-					if v, ok := sess.pending.Load(idStr); ok {
-						if pr, ok := v.(*pendingRequest); ok {
-							select {
-							case pr.respCh <- data:
-							default:
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		slog.Warn("GET SSE スキャンエラー", "error", err.Error(), "session_id", sessionID)
-	}
-	slog.Info("GET SSE チャネル終了", "session_id", sessionID)
 }
 
 func mustEnv(key string) string {
