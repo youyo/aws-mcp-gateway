@@ -690,6 +690,61 @@ func main() {
 	}
 }
 
+// M4: assumeRoleCredsCache + buildAssumeRoleARN + getAssumeRoleCredentials
+
+// assumeRoleCredsCache はユーザー×ロールごとの CredentialsCache をキャッシュする。
+// キー: "{account_id}::{role_name}::{subject}"
+var assumeRoleCredsCache sync.Map
+
+// buildAssumeRoleARN は accountID と roleName から IAM ロール ARN を生成する。
+func buildAssumeRoleARN(accountID, roleName string) string {
+	return fmt.Sprintf("arn:aws:iam::%s:role/%s", accountID, roleName)
+}
+
+// getAssumeRoleCredentials は (accountID, roleName, sub) をキーに CredentialsCache をキャッシュし、
+// AssumeRole による per-user クレデンシャルを返す。
+// AccessDenied 時はキャッシュエントリを削除してエラーを返す。
+// Throttling 等の transient エラー時はキャッシュを保持してエラーを返す。
+func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRoleAPIClient, accountID, roleName, sub string, maxTTL time.Duration) (*aws.CredentialsCache, error) {
+	cacheKey := accountID + "::" + roleName + "::" + sub
+
+	if cached, ok := assumeRoleCredsCache.Load(cacheKey); ok {
+		return cached.(*aws.CredentialsCache), nil
+	}
+
+	roleARN := buildAssumeRoleARN(accountID, roleName)
+	sessionName := sanitizeSessionName("gw-ar-" + sub)
+
+	provider := stscreds.NewAssumeRoleProvider(stsClient, roleARN, func(o *stscreds.AssumeRoleOptions) {
+		o.RoleSessionName = sessionName
+		o.Duration = maxTTL
+	})
+
+	// エビクションロジックを組み込んだ provider でラップした CredentialsCache をキャッシュする。
+	// この CredentialsCache を直接キャッシュすることで、キャッシュヒット時に同一ポインタを返せる。
+	evictingProvider := credentialsProviderFunc(func(innerCtx context.Context) (aws.Credentials, error) {
+		c, err := provider.Retrieve(innerCtx)
+		if err != nil {
+			if classifyFederatedError(err) != federatedErrTransient {
+				assumeRoleCredsCache.Delete(cacheKey)
+			}
+			return aws.Credentials{}, err
+		}
+		return c, nil
+	})
+
+	newCreds := aws.NewCredentialsCache(evictingProvider)
+	actual, _ := assumeRoleCredsCache.LoadOrStore(cacheKey, newCreds)
+	return actual.(*aws.CredentialsCache), nil
+}
+
+// credentialsProviderFunc は関数を aws.CredentialsProvider として使えるようにするアダプタ。
+type credentialsProviderFunc func(ctx context.Context) (aws.Credentials, error)
+
+func (f credentialsProviderFunc) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	return f(ctx)
+}
+
 // M1: validateAccountID / validateRoleName
 
 var (

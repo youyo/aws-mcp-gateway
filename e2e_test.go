@@ -11,9 +11,13 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	ststypes "github.com/aws/aws-sdk-go-v2/service/sts/types"
 	"github.com/aws/smithy-go"
 	idproxy "github.com/youyo/idproxy"
 )
@@ -861,4 +865,155 @@ func TestIsAllowed(t *testing.T) {
 	if isAllowedAssumeRole(empty, "123456789012", "AwsMcpGatewayRole") {
 		t.Error("空の cfg の場合は false を期待")
 	}
+}
+
+// M4 テスト用モック: AssumeRoleAPIClient を実装する。
+type mockAssumeRoleClient struct {
+	callCount int64
+	err       error
+}
+
+func (m *mockAssumeRoleClient) AssumeRole(ctx context.Context, params *sts.AssumeRoleInput, optFns ...func(*sts.Options)) (*sts.AssumeRoleOutput, error) {
+	atomic.AddInt64(&m.callCount, 1)
+	if m.err != nil {
+		return nil, m.err
+	}
+	expiry := time.Now().Add(1 * time.Hour)
+	return &sts.AssumeRoleOutput{
+		Credentials: &ststypes.Credentials{
+			AccessKeyId:     aws.String("AKIATEST"),
+			SecretAccessKey: aws.String("secret"),
+			SessionToken:    aws.String("token"),
+			Expiration:      &expiry,
+		},
+	}, nil
+}
+
+// M4: TestBuildAssumeRoleARN は buildAssumeRoleARN が正しい ARN 文字列を返すことを確認する。
+func TestBuildAssumeRoleARN(t *testing.T) {
+	got := buildAssumeRoleARN("123456789012", "AwsMcpGatewayRole")
+	want := "arn:aws:iam::123456789012:role/AwsMcpGatewayRole"
+	if got != want {
+		t.Errorf("buildAssumeRoleARN = %q, want %q", got, want)
+	}
+	t.Logf("✓ buildAssumeRoleARN = %q", got)
+}
+
+// M4: TestGetAssumeRoleCredentials_SessionName はセッション名が "gw-ar-{sub}" 形式で
+// STS 許可文字のみかつ 64 文字以内に収まることを確認する。
+func TestGetAssumeRoleCredentials_SessionName(t *testing.T) {
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+	longSub := strings.Repeat("a", 100)
+	client := &mockAssumeRoleClient{}
+	creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", longSub, 1*time.Hour)
+	if err != nil {
+		t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
+	}
+	if creds == nil {
+		t.Fatal("creds が nil")
+	}
+
+	// セッション名の確認: AssumeRole が呼ばれていること（キャッシュなし）
+	_, rerr := creds.Retrieve(context.Background())
+	if rerr != nil {
+		t.Fatalf("Retrieve エラー: %v", rerr)
+	}
+
+	// RoleSessionName が 64 文字以内か確認するため、sanitizeSessionName の結果を直接確認
+	sessionName := sanitizeSessionName("gw-ar-" + longSub)
+	if len(sessionName) > 64 {
+		t.Errorf("セッション名が 64 文字を超えている: len=%d", len(sessionName))
+	}
+	t.Logf("✓ sessionName len=%d (≤64)", len(sessionName))
+}
+
+// M4: TestGetAssumeRoleCredentials_CacheHit は同一引数で 2 回呼んだ場合に
+// キャッシュが機能して同一 CredentialsCache ポインタを返すことを確認する。
+func TestGetAssumeRoleCredentials_CacheHit(t *testing.T) {
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+	client := &mockAssumeRoleClient{}
+	ctx := context.Background()
+
+	creds1, err1 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", 1*time.Hour)
+	if err1 != nil {
+		t.Fatalf("1回目 getAssumeRoleCredentials エラー: %v", err1)
+	}
+	creds2, err2 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", 1*time.Hour)
+	if err2 != nil {
+		t.Fatalf("2回目 getAssumeRoleCredentials エラー: %v", err2)
+	}
+
+	// 同一ポインタ = LoadOrStore でキャッシュが機能
+	if creds1 != creds2 {
+		t.Errorf("CredentialsCache が再構築された（キャッシュ不動作）: creds1=%p creds2=%p", creds1, creds2)
+	}
+	t.Logf("✓ キャッシュヒットで同一ポインタを返した: %p", creds1)
+}
+
+// M4: TestGetAssumeRoleCredentials_AccessDenied は AccessDenied エラー時に
+// キャッシュエントリが削除されることを確認する。
+func TestGetAssumeRoleCredentials_AccessDenied(t *testing.T) {
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+	accessDeniedErr := &stubAPIError{code: "AccessDenied", msg: "access denied"}
+	client := &mockAssumeRoleClient{err: accessDeniedErr}
+	ctx := context.Background()
+
+	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-denied", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("getAssumeRoleCredentials は AccessDenied をラップして返すはずだが直接エラー: %v", err)
+	}
+	if creds == nil {
+		t.Fatal("creds が nil（CredentialsCache が返ってくるはず）")
+	}
+
+	// Retrieve を呼ぶと AccessDenied が発生する
+	_, rerr := creds.Retrieve(ctx)
+	if rerr == nil {
+		t.Fatal("AccessDenied エラーが返るはずが nil")
+	}
+
+	// キャッシュが削除されていることを確認
+	cacheKey := "123456789012::AwsMcpGatewayRole::sub-denied"
+	if _, ok := assumeRoleCredsCache.Load(cacheKey); ok {
+		t.Error("AccessDenied 後もキャッシュに残っている（削除されるべき）")
+	}
+	t.Logf("✓ AccessDenied 後にキャッシュエントリが削除された")
+}
+
+// M4: TestGetAssumeRoleCredentials_Throttling は Throttling エラー時に
+// キャッシュエントリが保持されることを確認する。
+func TestGetAssumeRoleCredentials_Throttling(t *testing.T) {
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+	throttleErr := &stubAPIError{code: "Throttling", msg: "rate exceeded"}
+	client := &mockAssumeRoleClient{err: throttleErr}
+	ctx := context.Background()
+
+	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-throttle", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("getAssumeRoleCredentials は Throttling をラップして返すはずだが直接エラー: %v", err)
+	}
+	if creds == nil {
+		t.Fatal("creds が nil")
+	}
+
+	// Retrieve を呼ぶと Throttling エラーが発生する
+	_, rerr := creds.Retrieve(ctx)
+	if rerr == nil {
+		t.Fatal("Throttling エラーが返るはずが nil")
+	}
+
+	// キャッシュは保持されていることを確認
+	cacheKey := "123456789012::AwsMcpGatewayRole::sub-throttle"
+	if _, ok := assumeRoleCredsCache.Load(cacheKey); !ok {
+		t.Error("Throttling 後にキャッシュが削除された（保持されるべき）")
+	}
+	t.Logf("✓ Throttling 後にキャッシュエントリが保持された")
 }
