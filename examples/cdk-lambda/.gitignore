@@ -1,0 +1,9 @@
+node_modules/
+cdk.out/
+dist/
+*.js
+*.d.ts
+!jest.config.js
+.cdk.staging/
+asset/bootstrap
+asset/*.zip
