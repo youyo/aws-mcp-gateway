@@ -760,12 +760,16 @@ func validateRoleName(s string) bool  { return reRoleName.MatchString(s) }
 type assumeRoleConfig struct {
 	allowedAccounts  []string
 	allowedRoleNames []string
+	maxCacheTTL      time.Duration
 }
+
+const defaultAssumeRoleMaxCacheTTL = 1 * time.Hour
 
 func loadAssumeRoleConfig() assumeRoleConfig {
 	cfg := assumeRoleConfig{
 		allowedAccounts:  splitCSV(os.Getenv("ASSUMEROLE_ALLOWED_ACCOUNTS")),
 		allowedRoleNames: splitCSV(os.Getenv("ASSUMEROLE_ALLOWED_ROLE_NAMES")),
+		maxCacheTTL:      defaultAssumeRoleMaxCacheTTL,
 	}
 	if len(cfg.allowedAccounts) == 0 || len(cfg.allowedRoleNames) == 0 {
 		slog.Warn("ASSUMEROLE_ALLOWED_ACCOUNTS or ASSUMEROLE_ALLOWED_ROLE_NAMES is not set; all /mcp/assumerole/ requests will be denied")
@@ -795,6 +799,92 @@ func isAllowedAssumeRole(cfg assumeRoleConfig, accountID, roleName string) bool 
 		}
 	}
 	return false
+}
+
+// M5: handleAssumeRoleRequest
+
+// handleAssumeRoleRequest は /mcp/assumerole/{account_id}/{role_name} へのリクエストを処理する。
+// バリデーション → allowlist 認可 → STS AssumeRole → SigV4 署名プロキシ の順で処理する。
+// エラーレスポンスには内部詳細（ARN、STS エラー文字列）を含めない（fail-closed）。
+func handleAssumeRoleRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+	user *idproxy.User,
+	cfg assumeRoleConfig,
+	target *url.URL,
+	stsClient stscreds.AssumeRoleAPIClient,
+	mcpRegion string,
+	targetAWSRegion string,
+) {
+	accountID := r.PathValue("account_id")
+	roleName := r.PathValue("role_name")
+
+	if !validateAccountID(accountID) {
+		http.Error(w, "invalid account_id", http.StatusBadRequest)
+		return
+	}
+	if !validateRoleName(roleName) {
+		http.Error(w, "invalid role_name", http.StatusBadRequest)
+		return
+	}
+
+	if !isAllowedAssumeRole(cfg, accountID, roleName) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	if user == nil || user.Subject == "" {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	creds, err := getAssumeRoleCredentials(r.Context(), stsClient, accountID, roleName, user.Subject, cfg.maxCacheTTL)
+	if err != nil {
+		slog.Error("getAssumeRoleCredentials failed", "error", err.Error())
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	// STS は Retrieve() 時に実際に呼ばれる。事前取得でエラーを HTTP ステータスへ変換する。
+	// CredentialsCache が結果をキャッシュするため、proxy 内の再呼び出しは追加 STS コールにならない。
+	if _, rerr := creds.Retrieve(r.Context()); rerr != nil {
+		switch classifyFederatedError(rerr) {
+		case federatedErrForbidden:
+			http.Error(w, "forbidden", http.StatusForbidden)
+		default:
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		}
+		return
+	}
+
+	roleARN := buildAssumeRoleARN(accountID, roleName)
+	sessionName := sanitizeSessionName("gw-ar-" + user.Subject)
+	slog.Info("assumerole request",
+		"account_id", accountID,
+		"role_name", roleName,
+		"role_arn", roleARN,
+		"session_name", sessionName,
+		"user_sub", user.Subject,
+		"user_email", user.Email,
+	)
+
+	r, ok := injectMetaAWSRegion(r, targetAWSRegion)
+	if !ok {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	// makeFederatedRoundTripper と同パターンで STS クレデンシャルを注入した SigV4 Transport を組み立てる。
+	transport := &sigV4RoundTripper{
+		base:    sigV4HTTPTransport,
+		signer:  v4.NewSigner(),
+		region:  mcpRegion,
+		service: awsMCPService,
+		getCreds: func(ctx context.Context) (aws.Credentials, error) {
+			return creds.Retrieve(ctx)
+		},
+	}
+	buildProxy(target, transport).ServeHTTP(w, r)
 }
 
 // splitCSV splits a comma-separated string into a trimmed slice, returning nil for empty input.

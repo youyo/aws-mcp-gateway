@@ -1017,3 +1017,255 @@ func TestGetAssumeRoleCredentials_Throttling(t *testing.T) {
 	}
 	t.Logf("✓ Throttling 後にキャッシュエントリが保持された")
 }
+
+// M5: handleAssumeRoleRequest のテスト
+
+// mockSTSClientM5 は AssumeRoleAPIClient を実装するモック（M5 テスト用）。
+type mockSTSClientM5 struct {
+	err error
+}
+
+func (m *mockSTSClientM5) AssumeRole(ctx context.Context, params *sts.AssumeRoleInput, optFns ...func(*sts.Options)) (*sts.AssumeRoleOutput, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	expiry := time.Now().Add(1 * time.Hour)
+	return &sts.AssumeRoleOutput{
+		Credentials: &ststypes.Credentials{
+			AccessKeyId:     aws.String("AKIATESM5"),
+			SecretAccessKey: aws.String("secretm5"),
+			SessionToken:    aws.String("tokenm5"),
+			Expiration:      &expiry,
+		},
+	}, nil
+}
+
+func TestHandleAssumeRoleRequest(t *testing.T) {
+	const (
+		allowedAccount = "123456789012"
+		allowedRole    = "AwsMcpGatewayRole"
+		mcpRegion      = "us-east-1"
+		targetRegion   = "ap-northeast-1"
+	)
+
+	validUser := &idproxy.User{
+		Email:   "alice@example.com",
+		Subject: "sub-alice",
+	}
+
+	validCfg := assumeRoleConfig{
+		allowedAccounts:  []string{allowedAccount},
+		allowedRoleNames: []string{allowedRole},
+		maxCacheTTL:      1 * time.Hour,
+	}
+
+	// モックアップストリームサーバー（Authorization ヘッダーをキャプチャ）
+	var capturedAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+
+	t.Run("正常系 POST: 200 および Authorization ヘッダー付き", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		capturedAuth = ""
+		stsClient := &mockSTSClientM5{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/mcp/assumerole/"+allowedAccount+"/"+allowedRole, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+		req.SetPathValue("account_id", allowedAccount)
+		req.SetPathValue("role_name", allowedRole)
+
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("期待値 200、実際: %d body=%s", rec.Code, rec.Body.String())
+		}
+		if !strings.HasPrefix(capturedAuth, "AWS4-HMAC-SHA256") {
+			t.Errorf("SigV4 Authorization ヘッダーが付いていない: %q", capturedAuth)
+		}
+		t.Logf("✓ 正常系 POST: status=%d Authorization=%s...", rec.Code, capturedAuth[:min(50, len(capturedAuth))])
+	})
+
+	t.Run("account_id 不正: 400", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		stsClient := &mockSTSClientM5{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+		req.SetPathValue("account_id", "bad-account")
+		req.SetPathValue("role_name", allowedRole)
+
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("期待値 400、実際: %d", rec.Code)
+		}
+		body := strings.TrimSpace(rec.Body.String())
+		if body != "invalid account_id" {
+			t.Errorf("期待値 %q、実際: %q", "invalid account_id", body)
+		}
+		t.Logf("✓ 不正 account_id: status=%d body=%q", rec.Code, body)
+	})
+
+	t.Run("role_name 不正: 400", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		stsClient := &mockSTSClientM5{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+		req.SetPathValue("account_id", allowedAccount)
+		req.SetPathValue("role_name", "../evil")
+
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("期待値 400、実際: %d", rec.Code)
+		}
+		body := strings.TrimSpace(rec.Body.String())
+		if body != "invalid role_name" {
+			t.Errorf("期待値 %q、実際: %q", "invalid role_name", body)
+		}
+		t.Logf("✓ 不正 role_name: status=%d body=%q", rec.Code, body)
+	})
+
+	t.Run("allowlist 外 account: 403", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		stsClient := &mockSTSClientM5{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+		req.SetPathValue("account_id", "999999999999")
+		req.SetPathValue("role_name", allowedRole)
+
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("期待値 403、実際: %d", rec.Code)
+		}
+		body := strings.TrimSpace(rec.Body.String())
+		if body != "forbidden" {
+			t.Errorf("期待値 %q、実際: %q", "forbidden", body)
+		}
+		t.Logf("✓ allowlist 外 account: status=%d body=%q", rec.Code, body)
+	})
+
+	t.Run("allowlist 外 role: 403", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		stsClient := &mockSTSClientM5{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+		req.SetPathValue("account_id", allowedAccount)
+		req.SetPathValue("role_name", "OtherRole")
+
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("期待値 403、実際: %d", rec.Code)
+		}
+		body := strings.TrimSpace(rec.Body.String())
+		if body != "forbidden" {
+			t.Errorf("期待値 %q、実際: %q", "forbidden", body)
+		}
+		t.Logf("✓ allowlist 外 role: status=%d body=%q", rec.Code, body)
+	})
+
+	t.Run("user が nil: 500", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		stsClient := &mockSTSClientM5{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+		req.SetPathValue("account_id", allowedAccount)
+		req.SetPathValue("role_name", allowedRole)
+
+		handleAssumeRoleRequest(rec, req, nil, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("期待値 500、実際: %d", rec.Code)
+		}
+		t.Logf("✓ user=nil: status=%d", rec.Code)
+	})
+
+	t.Run("user.Subject が空: 500", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		stsClient := &mockSTSClientM5{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+		req.SetPathValue("account_id", allowedAccount)
+		req.SetPathValue("role_name", allowedRole)
+		emptyUser := &idproxy.User{Email: "alice@example.com", Subject: ""}
+
+		handleAssumeRoleRequest(rec, req, emptyUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("期待値 500、実際: %d", rec.Code)
+		}
+		t.Logf("✓ user.Subject 空: status=%d", rec.Code)
+	})
+
+	t.Run("STS AccessDenied: 403、ボディに ARN や AccessDenied を含まない", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		accessDeniedErr := &stubAPIError{code: "AccessDenied", msg: "AccessDenied: User is not authorized"}
+		stsClient := &mockSTSClientM5{err: accessDeniedErr}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+		req.SetPathValue("account_id", allowedAccount)
+		req.SetPathValue("role_name", allowedRole)
+
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("期待値 403、実際: %d", rec.Code)
+		}
+		body := strings.TrimSpace(rec.Body.String())
+		if strings.Contains(body, "arn:") {
+			t.Errorf("エラーボディに ARN が含まれている: %q", body)
+		}
+		if strings.Contains(body, "AccessDenied") {
+			t.Errorf("エラーボディに AccessDenied が含まれている: %q", body)
+		}
+		t.Logf("✓ STS AccessDenied: status=%d body=%q", rec.Code, body)
+	})
+
+	t.Run("STS Throttling: 503", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		throttleErr := &stubAPIError{code: "Throttling", msg: "rate exceeded"}
+		stsClient := &mockSTSClientM5{err: throttleErr}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+		req.SetPathValue("account_id", allowedAccount)
+		req.SetPathValue("role_name", allowedRole)
+
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("期待値 503、実際: %d", rec.Code)
+		}
+		t.Logf("✓ STS Throttling: status=%d", rec.Code)
+	})
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
