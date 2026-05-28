@@ -812,7 +812,7 @@ func TestValidateRoleName(t *testing.T) {
 			t.Errorf("validateRoleName(%q) = false, want true", s)
 		}
 	}
-	invalid := []string{"../evil", "role;drop", "", "\x00", "ロール名"}
+	invalid := []string{"../evil", "..", "role;drop", "", "\x00", "ロール名"}
 	for _, s := range invalid {
 		if validateRoleName(s) {
 			t.Errorf("validateRoleName(%q) = true, want false", s)
@@ -825,6 +825,7 @@ func TestLoadAssumeRoleConfig(t *testing.T) {
 	t.Run("環境変数未設定時はnilスライス", func(t *testing.T) {
 		t.Setenv("ASSUMEROLE_ALLOWED_ACCOUNTS", "")
 		t.Setenv("ASSUMEROLE_ALLOWED_ROLE_NAMES", "")
+		t.Setenv("ASSUMEROLE_MAX_CACHE_TTL", "")
 		cfg := loadAssumeRoleConfig()
 		if cfg.allowedAccounts != nil {
 			t.Errorf("allowedAccounts = %v, want nil", cfg.allowedAccounts)
@@ -832,16 +833,41 @@ func TestLoadAssumeRoleConfig(t *testing.T) {
 		if cfg.allowedRoleNames != nil {
 			t.Errorf("allowedRoleNames = %v, want nil", cfg.allowedRoleNames)
 		}
+		if cfg.maxCacheTTL != defaultAssumeRoleMaxCacheTTL {
+			t.Errorf("maxCacheTTL = %v, want %v", cfg.maxCacheTTL, defaultAssumeRoleMaxCacheTTL)
+		}
 	})
 	t.Run("カンマ区切りで2要素", func(t *testing.T) {
 		t.Setenv("ASSUMEROLE_ALLOWED_ACCOUNTS", "111111111111,222222222222")
 		t.Setenv("ASSUMEROLE_ALLOWED_ROLE_NAMES", "RoleA,RoleB")
+		t.Setenv("ASSUMEROLE_MAX_CACHE_TTL", "")
 		cfg := loadAssumeRoleConfig()
 		if len(cfg.allowedAccounts) != 2 {
 			t.Errorf("allowedAccounts len = %d, want 2", len(cfg.allowedAccounts))
 		}
 		if len(cfg.allowedRoleNames) != 2 {
 			t.Errorf("allowedRoleNames len = %d, want 2", len(cfg.allowedRoleNames))
+		}
+	})
+	t.Run("ASSUMEROLE_MAX_CACHE_TTL 有効値", func(t *testing.T) {
+		t.Setenv("ASSUMEROLE_MAX_CACHE_TTL", "30m")
+		cfg := loadAssumeRoleConfig()
+		if cfg.maxCacheTTL != 30*time.Minute {
+			t.Errorf("maxCacheTTL = %v, want 30m", cfg.maxCacheTTL)
+		}
+	})
+	t.Run("ASSUMEROLE_MAX_CACHE_TTL 不正値はデフォルト使用", func(t *testing.T) {
+		t.Setenv("ASSUMEROLE_MAX_CACHE_TTL", "invalid")
+		cfg := loadAssumeRoleConfig()
+		if cfg.maxCacheTTL != defaultAssumeRoleMaxCacheTTL {
+			t.Errorf("maxCacheTTL = %v, want %v", cfg.maxCacheTTL, defaultAssumeRoleMaxCacheTTL)
+		}
+	})
+	t.Run("ASSUMEROLE_MAX_CACHE_TTL 最小値未満は最小値に切り上げ", func(t *testing.T) {
+		t.Setenv("ASSUMEROLE_MAX_CACHE_TTL", "1m")
+		cfg := loadAssumeRoleConfig()
+		if cfg.maxCacheTTL != minAssumeRoleMaxCacheTTL {
+			t.Errorf("maxCacheTTL = %v, want %v", cfg.maxCacheTTL, minAssumeRoleMaxCacheTTL)
 		}
 	})
 }
@@ -1077,7 +1103,7 @@ func TestHandleAssumeRoleRequest(t *testing.T) {
 		capturedAuth = ""
 		stsClient := &mockSTSClientM5{}
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/mcp/assumerole/"+allowedAccount+"/"+allowedRole, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+		req := httptest.NewRequest(http.MethodPost, "/mcp/assumerole/accounts/"+allowedAccount+"/rolename/"+allowedRole, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
 		req.SetPathValue("account_id", allowedAccount)
 		req.SetPathValue("role_name", allowedRole)
 
@@ -1263,13 +1289,6 @@ func TestHandleAssumeRoleRequest(t *testing.T) {
 	})
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // TestAssumeRoleEndpointRouting: /mcp/assumerole/{account_id}/{role_name} が
 // assumerole ハンドラにルーティングされ、PathValue が正しく取得できることを確認する。
 // ASSUMEROLE_ALLOWED_ACCOUNTS / ASSUMEROLE_ALLOWED_ROLE_NAMES 未設定時は 403 が返ることも確認する。
@@ -1304,7 +1323,7 @@ func TestAssumeRoleEndpointRouting(t *testing.T) {
 	})
 
 	mux := http.NewServeMux()
-	mux.Handle("/mcp/assumerole/{account_id}/{role_name}", assumeRoleHandler)
+	mux.Handle("/mcp/assumerole/accounts/{account_id}/rolename/{role_name}", assumeRoleHandler)
 	mux.Handle("/", defaultHandler)
 
 	srv := httptest.NewServer(mux)
@@ -1316,7 +1335,7 @@ func TestAssumeRoleEndpointRouting(t *testing.T) {
 		capturedAccountID = ""
 		capturedRoleName = ""
 
-		resp, err := http.Post(srv.URL+"/mcp/assumerole/123456789012/AwsMcpGatewayRole",
+		resp, err := http.Post(srv.URL+"/mcp/assumerole/accounts/123456789012/rolename/AwsMcpGatewayRole",
 			"application/json", strings.NewReader(`{}`))
 		if err != nil {
 			t.Fatalf("リクエスト失敗: %v", err)

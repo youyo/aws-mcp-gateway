@@ -648,9 +648,9 @@ func main() {
 	}
 	stsClient := sts.NewFromConfig(stsBaseCfg)
 
-	// /mcp/assumerole/{account_id}/{role_name} は /mcp より具体的なため
+	// /mcp/assumerole/accounts/{account_id}/rolename/{role_name} は /mcp より具体的なため
 	// Go 1.22+ の net/http パターンマッチングで自動的に優先される。
-	http.Handle("/mcp/assumerole/{account_id}/{role_name}", auth.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/mcp/assumerole/accounts/{account_id}/rolename/{role_name}", auth.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user := idproxy.UserFromContext(r.Context())
 		handleAssumeRoleRequest(w, r, user, assumeRoleCfg, target, stsClient, mcpRegion, targetAWSRegion)
 	})))
@@ -709,9 +709,14 @@ func main() {
 	}
 }
 
-// M4: assumeRoleCredsCache + buildAssumeRoleARN + getAssumeRoleCredentials
+// assumeRoleCacheEntry はキャッシュエントリの作成時刻付きラッパー。
+// maxCacheTTL 経過後は強制的に再作成してメモリリークを防ぐ。
+type assumeRoleCacheEntry struct {
+	creds     *aws.CredentialsCache
+	createdAt time.Time
+}
 
-// assumeRoleCredsCache はユーザー×ロールごとの CredentialsCache をキャッシュする。
+// assumeRoleCredsCache はユーザー×ロールごとの *assumeRoleCacheEntry をキャッシュする。
 // キー: "{account_id}::{role_name}::{subject}"
 var assumeRoleCredsCache sync.Map
 
@@ -722,13 +727,18 @@ func buildAssumeRoleARN(accountID, roleName string) string {
 
 // getAssumeRoleCredentials は (accountID, roleName, sub) をキーに CredentialsCache をキャッシュし、
 // AssumeRole による per-user クレデンシャルを返す。
+// maxCacheTTL 経過後はエントリを削除して再作成する（メモリリーク防止）。
 // AccessDenied 時はキャッシュエントリを削除してエラーを返す。
 // Throttling 等の transient エラー時はキャッシュを保持してエラーを返す。
 func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRoleAPIClient, accountID, roleName, sub string, maxTTL time.Duration) (*aws.CredentialsCache, error) {
 	cacheKey := accountID + "::" + roleName + "::" + sub
 
 	if cached, ok := assumeRoleCredsCache.Load(cacheKey); ok {
-		return cached.(*aws.CredentialsCache), nil
+		entry := cached.(*assumeRoleCacheEntry)
+		if time.Since(entry.createdAt) < maxTTL {
+			return entry.creds, nil
+		}
+		assumeRoleCredsCache.Delete(cacheKey)
 	}
 
 	roleARN := buildAssumeRoleARN(accountID, roleName)
@@ -740,7 +750,6 @@ func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRole
 	})
 
 	// エビクションロジックを組み込んだ provider でラップした CredentialsCache をキャッシュする。
-	// この CredentialsCache を直接キャッシュすることで、キャッシュヒット時に同一ポインタを返せる。
 	evictingProvider := credentialsProviderFunc(func(innerCtx context.Context) (aws.Credentials, error) {
 		c, err := provider.Retrieve(innerCtx)
 		if err != nil {
@@ -752,9 +761,12 @@ func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRole
 		return c, nil
 	})
 
-	newCreds := aws.NewCredentialsCache(evictingProvider)
-	actual, _ := assumeRoleCredsCache.LoadOrStore(cacheKey, newCreds)
-	return actual.(*aws.CredentialsCache), nil
+	newEntry := &assumeRoleCacheEntry{
+		creds:     aws.NewCredentialsCache(evictingProvider),
+		createdAt: time.Now(),
+	}
+	actual, _ := assumeRoleCredsCache.LoadOrStore(cacheKey, newEntry)
+	return actual.(*assumeRoleCacheEntry).creds, nil
 }
 
 // credentialsProviderFunc は関数を aws.CredentialsProvider として使えるようにするアダプタ。
@@ -764,17 +776,18 @@ func (f credentialsProviderFunc) Retrieve(ctx context.Context) (aws.Credentials,
 	return f(ctx)
 }
 
-// M1: validateAccountID / validateRoleName
-
 var (
 	reAccountID = regexp.MustCompile(`^[0-9]{12}$`)
 	reRoleName  = regexp.MustCompile(`^[A-Za-z0-9+=,.@_-]+$`)
 )
 
 func validateAccountID(s string) bool { return reAccountID.MatchString(s) }
-func validateRoleName(s string) bool  { return reRoleName.MatchString(s) }
-
-// M2: assumeRoleConfig / loadAssumeRoleConfig
+func validateRoleName(s string) bool {
+	if strings.Contains(s, "..") {
+		return false
+	}
+	return reRoleName.MatchString(s)
+}
 
 type assumeRoleConfig struct {
 	allowedAccounts  []string
@@ -782,7 +795,10 @@ type assumeRoleConfig struct {
 	maxCacheTTL      time.Duration
 }
 
-const defaultAssumeRoleMaxCacheTTL = 1 * time.Hour
+const (
+	defaultAssumeRoleMaxCacheTTL = 55 * time.Minute
+	minAssumeRoleMaxCacheTTL     = 5 * time.Minute
+)
 
 func loadAssumeRoleConfig() assumeRoleConfig {
 	cfg := assumeRoleConfig{
@@ -790,13 +806,21 @@ func loadAssumeRoleConfig() assumeRoleConfig {
 		allowedRoleNames: splitCSV(os.Getenv("ASSUMEROLE_ALLOWED_ROLE_NAMES")),
 		maxCacheTTL:      defaultAssumeRoleMaxCacheTTL,
 	}
+	if raw := os.Getenv("ASSUMEROLE_MAX_CACHE_TTL"); raw != "" {
+		if d, err := time.ParseDuration(raw); err != nil {
+			slog.Error("invalid ASSUMEROLE_MAX_CACHE_TTL, using default", "value", raw, "err", err, "default", defaultAssumeRoleMaxCacheTTL)
+		} else if d < minAssumeRoleMaxCacheTTL {
+			slog.Warn("ASSUMEROLE_MAX_CACHE_TTL too short, using minimum", "value", d, "min", minAssumeRoleMaxCacheTTL)
+			cfg.maxCacheTTL = minAssumeRoleMaxCacheTTL
+		} else {
+			cfg.maxCacheTTL = d
+		}
+	}
 	if len(cfg.allowedAccounts) == 0 || len(cfg.allowedRoleNames) == 0 {
 		slog.Warn("ASSUMEROLE_ALLOWED_ACCOUNTS or ASSUMEROLE_ALLOWED_ROLE_NAMES is not set; all /mcp/assumerole/ requests will be denied")
 	}
 	return cfg
 }
-
-// M3: isAllowedAssumeRole
 
 func isAllowedAssumeRole(cfg assumeRoleConfig, accountID, roleName string) bool {
 	if len(cfg.allowedAccounts) == 0 || len(cfg.allowedRoleNames) == 0 {
@@ -820,9 +844,7 @@ func isAllowedAssumeRole(cfg assumeRoleConfig, accountID, roleName string) bool 
 	return false
 }
 
-// M5: handleAssumeRoleRequest
-
-// handleAssumeRoleRequest は /mcp/assumerole/{account_id}/{role_name} へのリクエストを処理する。
+// handleAssumeRoleRequest は /mcp/assumerole/accounts/{account_id}/rolename/{role_name} へのリクエストを処理する。
 // バリデーション → allowlist 認可 → STS AssumeRole → SigV4 署名プロキシ の順で処理する。
 // エラーレスポンスには内部詳細（ARN、STS エラー文字列）を含めない（fail-closed）。
 func handleAssumeRoleRequest(
@@ -849,21 +871,21 @@ func handleAssumeRoleRequest(
 		return
 	}
 
-	if !isAllowedAssumeRole(cfg, accountID, roleName) {
-		slog.Warn("assumerole forbidden: not in allowlist",
-			"account_id", accountID,
-			"role_name", roleName,
-		)
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
 	if user == nil || user.Subject == "" {
 		slog.Error("assumerole missing user subject",
 			"account_id", accountID,
 			"role_name", roleName,
 		)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if !isAllowedAssumeRole(cfg, accountID, roleName) {
+		slog.Warn("assumerole forbidden: not in allowlist",
+			"account_id", accountID,
+			"role_name", roleName,
+		)
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
