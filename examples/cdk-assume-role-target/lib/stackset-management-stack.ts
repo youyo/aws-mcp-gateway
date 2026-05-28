@@ -7,6 +7,12 @@ export interface StackSetManagementStackProps extends cdk.StackProps {
   stackSetName: string;
   organizationalUnitIds: string[];
   regions: string[];
+  /**
+   * StackSet 操作の実行者種別。
+   * マネジメントアカウントからは 'SELF' (デフォルト)、
+   * 委任管理者(delegated administrator)からは 'DELEGATED_ADMIN' を指定する。
+   */
+  callAs?: 'SELF' | 'DELEGATED_ADMIN';
 }
 
 /**
@@ -20,10 +26,11 @@ export class StackSetManagementStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: StackSetManagementStackProps) {
     super(scope, id, props);
 
-    const { templateBody, stackSetName, organizationalUnitIds, regions } = props;
+    const { templateBody, stackSetName, organizationalUnitIds, regions, callAs } = props;
 
     new cloudformation.CfnStackSet(this, 'TargetRoleStackSet', {
       permissionModel: 'SERVICE_MANAGED',
+      callAs: callAs ?? 'SELF',
       stackSetName,
       capabilities: ['CAPABILITY_NAMED_IAM'],
       autoDeployment: {
