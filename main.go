@@ -31,6 +31,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -687,6 +688,58 @@ func main() {
 		slog.Error("server error", "error", err.Error())
 		os.Exit(1)
 	}
+}
+
+// M1: validateAccountID / validateRoleName
+
+var (
+	reAccountID = regexp.MustCompile(`^[0-9]{12}$`)
+	reRoleName  = regexp.MustCompile(`^[A-Za-z0-9+=,.@_-]+$`)
+)
+
+func validateAccountID(s string) bool { return reAccountID.MatchString(s) }
+func validateRoleName(s string) bool  { return reRoleName.MatchString(s) }
+
+// M2: assumeRoleConfig / loadAssumeRoleConfig
+
+type assumeRoleConfig struct {
+	allowedAccounts  []string
+	allowedRoleNames []string
+}
+
+func loadAssumeRoleConfig() assumeRoleConfig {
+	cfg := assumeRoleConfig{
+		allowedAccounts:  splitCSV(os.Getenv("ASSUMEROLE_ALLOWED_ACCOUNTS")),
+		allowedRoleNames: splitCSV(os.Getenv("ASSUMEROLE_ALLOWED_ROLE_NAMES")),
+	}
+	if len(cfg.allowedAccounts) == 0 || len(cfg.allowedRoleNames) == 0 {
+		slog.Warn("ASSUMEROLE_ALLOWED_ACCOUNTS or ASSUMEROLE_ALLOWED_ROLE_NAMES is not set; all /mcp/assumerole/ requests will be denied")
+	}
+	return cfg
+}
+
+// M3: isAllowedAssumeRole
+
+func isAllowedAssumeRole(cfg assumeRoleConfig, accountID, roleName string) bool {
+	if len(cfg.allowedAccounts) == 0 || len(cfg.allowedRoleNames) == 0 {
+		return false
+	}
+	accountOK := false
+	for _, a := range cfg.allowedAccounts {
+		if a == accountID {
+			accountOK = true
+			break
+		}
+	}
+	if !accountOK {
+		return false
+	}
+	for _, r := range cfg.allowedRoleNames {
+		if r == roleName {
+			return true
+		}
+	}
+	return false
 }
 
 // splitCSV splits a comma-separated string into a trimmed slice, returning nil for empty input.

@@ -783,3 +783,82 @@ func TestOIDCUserLoggingWithUser(t *testing.T) {
 	t.Logf("✓ UserFromContext(空コンテキスト) = nil 確認")
 	t.Logf("✓ User{Email: %s, Subject: %s} フィールドアクセス確認", dummyUser.Email, dummyUser.Subject)
 }
+
+// M1: validateAccountID のテスト
+func TestValidateAccountID(t *testing.T) {
+	valid := []string{"123456789012"}
+	for _, s := range valid {
+		if !validateAccountID(s) {
+			t.Errorf("validateAccountID(%q) = false, want true", s)
+		}
+	}
+	invalid := []string{"12345", "abc", "", "1234567890123", " 123456789012"}
+	for _, s := range invalid {
+		if validateAccountID(s) {
+			t.Errorf("validateAccountID(%q) = true, want false", s)
+		}
+	}
+}
+
+// M1: validateRoleName のテスト
+func TestValidateRoleName(t *testing.T) {
+	valid := []string{"AwsMcpGatewayRole", "role+=,.@_-"}
+	for _, s := range valid {
+		if !validateRoleName(s) {
+			t.Errorf("validateRoleName(%q) = false, want true", s)
+		}
+	}
+	invalid := []string{"../evil", "role;drop", "", "\x00", "ロール名"}
+	for _, s := range invalid {
+		if validateRoleName(s) {
+			t.Errorf("validateRoleName(%q) = true, want false", s)
+		}
+	}
+}
+
+// M2: loadAssumeRoleConfig のテスト
+func TestLoadAssumeRoleConfig(t *testing.T) {
+	t.Run("環境変数未設定時はnilスライス", func(t *testing.T) {
+		t.Setenv("ASSUMEROLE_ALLOWED_ACCOUNTS", "")
+		t.Setenv("ASSUMEROLE_ALLOWED_ROLE_NAMES", "")
+		cfg := loadAssumeRoleConfig()
+		if cfg.allowedAccounts != nil {
+			t.Errorf("allowedAccounts = %v, want nil", cfg.allowedAccounts)
+		}
+		if cfg.allowedRoleNames != nil {
+			t.Errorf("allowedRoleNames = %v, want nil", cfg.allowedRoleNames)
+		}
+	})
+	t.Run("カンマ区切りで2要素", func(t *testing.T) {
+		t.Setenv("ASSUMEROLE_ALLOWED_ACCOUNTS", "111111111111,222222222222")
+		t.Setenv("ASSUMEROLE_ALLOWED_ROLE_NAMES", "RoleA,RoleB")
+		cfg := loadAssumeRoleConfig()
+		if len(cfg.allowedAccounts) != 2 {
+			t.Errorf("allowedAccounts len = %d, want 2", len(cfg.allowedAccounts))
+		}
+		if len(cfg.allowedRoleNames) != 2 {
+			t.Errorf("allowedRoleNames len = %d, want 2", len(cfg.allowedRoleNames))
+		}
+	})
+}
+
+// M3: isAllowedAssumeRole のテスト
+func TestIsAllowed(t *testing.T) {
+	cfg := assumeRoleConfig{
+		allowedAccounts:  []string{"123456789012"},
+		allowedRoleNames: []string{"AwsMcpGatewayRole"},
+	}
+	if !isAllowedAssumeRole(cfg, "123456789012", "AwsMcpGatewayRole") {
+		t.Error("両方含む場合は true を期待")
+	}
+	if isAllowedAssumeRole(cfg, "999999999999", "AwsMcpGatewayRole") {
+		t.Error("account が許可リスト外の場合は false を期待")
+	}
+	if isAllowedAssumeRole(cfg, "123456789012", "OtherRole") {
+		t.Error("role が許可リスト外の場合は false を期待")
+	}
+	empty := assumeRoleConfig{}
+	if isAllowedAssumeRole(empty, "123456789012", "AwsMcpGatewayRole") {
+		t.Error("空の cfg の場合は false を期待")
+	}
+}
