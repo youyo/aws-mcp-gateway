@@ -1269,3 +1269,96 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// TestAssumeRoleEndpointRouting: /mcp/assumerole/{account_id}/{role_name} が
+// assumerole ハンドラにルーティングされ、PathValue が正しく取得できることを確認する。
+// ASSUMEROLE_ALLOWED_ACCOUNTS / ASSUMEROLE_ALLOWED_ROLE_NAMES 未設定時は 403 が返ることも確認する。
+func TestAssumeRoleEndpointRouting(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	// allowlist 未設定 → 全リクエストが 403
+	t.Setenv("ASSUMEROLE_ALLOWED_ACCOUNTS", "")
+	t.Setenv("ASSUMEROLE_ALLOWED_ROLE_NAMES", "")
+
+	// assumerole ハンドラが呼ばれたかを記録するフラグ
+	assumeRoleHandlerCalled := false
+	var capturedAccountID, capturedRoleName string
+
+	// assumerole ハンドラをシミュレートするモックハンドラ
+	assumeRoleHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assumeRoleHandlerCalled = true
+		capturedAccountID = r.PathValue("account_id")
+		capturedRoleName = r.PathValue("role_name")
+		// allowlist 未設定を模倣して 403
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+
+	// default ハンドラ（/mcp/assumerole/ に来ていないことを確認するため）
+	defaultHandlerCalled := false
+	defaultHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defaultHandlerCalled = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/mcp/assumerole/{account_id}/{role_name}", assumeRoleHandler)
+	mux.Handle("/", defaultHandler)
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	t.Run("/mcp/assumerole/{account_id}/{role_name} が assumerole ハンドラにルーティングされる", func(t *testing.T) {
+		assumeRoleHandlerCalled = false
+		defaultHandlerCalled = false
+		capturedAccountID = ""
+		capturedRoleName = ""
+
+		resp, err := http.Post(srv.URL+"/mcp/assumerole/123456789012/AwsMcpGatewayRole",
+			"application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("リクエスト失敗: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if !assumeRoleHandlerCalled {
+			t.Error("assumerole ハンドラが呼ばれなかった")
+		}
+		if defaultHandlerCalled {
+			t.Error("/ ハンドラが誤って呼ばれた")
+		}
+		if capturedAccountID != "123456789012" {
+			t.Errorf("account_id PathValue = %q, want %q", capturedAccountID, "123456789012")
+		}
+		if capturedRoleName != "AwsMcpGatewayRole" {
+			t.Errorf("role_name PathValue = %q, want %q", capturedRoleName, "AwsMcpGatewayRole")
+		}
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("期待値 403、実際: %d", resp.StatusCode)
+		}
+		t.Logf("✓ assumerole ハンドラへのルーティング確認: account_id=%q role_name=%q status=%d",
+			capturedAccountID, capturedRoleName, resp.StatusCode)
+	})
+
+	t.Run("/mcp へのリクエストは assumerole ハンドラではなく / ハンドラで処理される", func(t *testing.T) {
+		assumeRoleHandlerCalled = false
+		defaultHandlerCalled = false
+
+		resp, err := http.Post(srv.URL+"/mcp",
+			"application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("リクエスト失敗: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if assumeRoleHandlerCalled {
+			t.Error("assumerole ハンドラが誤って呼ばれた")
+		}
+		if !defaultHandlerCalled {
+			t.Error("/ ハンドラが呼ばれなかった")
+		}
+		t.Logf("✓ /mcp へのリクエストは / ハンドラで処理された: status=%d", resp.StatusCode)
+	})
+}

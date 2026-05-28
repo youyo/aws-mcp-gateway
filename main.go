@@ -1,13 +1,14 @@
 // aws-mcp-gateway: OIDC-authenticated reverse proxy for AWS MCP Server.
 //
 // Architecture:
-//   MCP Client (Claude Code etc.)
-//     ↓ OAuth 2.1 (Bearer Token)
-//   idproxy (EntraID OIDC auth)
-//     ↓ upstream HTTP
-//   httputil.ReverseProxy + SigV4 RoundTripper
-//     ↓ Streamable HTTP + SigV4
-//   AWS MCP Server (managed)
+//
+//	MCP Client (Claude Code etc.)
+//	  ↓ OAuth 2.1 (Bearer Token)
+//	idproxy (EntraID OIDC auth)
+//	  ↓ upstream HTTP
+//	httputil.ReverseProxy + SigV4 RoundTripper
+//	  ↓ Streamable HTTP + SigV4
+//	AWS MCP Server (managed)
 //
 // AWS credentials are resolved automatically from the environment
 // (Lambda execution role, ECS task role, EC2 instance profile, etc.)
@@ -162,7 +163,9 @@ func tokenFingerprint(idToken string) string {
 // per-user SigV4 RoundTripper を返す。同一トークンでの二回目以降は STS 呼び出しなし。
 //
 // assumeRoleARN が空でない場合はロールチェーンを構成する:
-//   OIDC IDToken → roleARN (AssumeRoleWithWebIdentity) → assumeRoleARN (AssumeRole)
+//
+//	OIDC IDToken → roleARN (AssumeRoleWithWebIdentity) → assumeRoleARN (AssumeRole)
+//
 // ユーザー別の CloudTrail 追跡（RoleSessionName = gw-{sub}）は roleARN の
 // セッション名で引き続き機能する。
 func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idToken, sub, assumeRoleARN string) (*sigV4RoundTripper, error) {
@@ -497,7 +500,6 @@ func handleFederatedRequest(w http.ResponseWriter, r *http.Request, user *idprox
 	buildProxy(cfg.target, federatedTransport).ServeHTTP(w, r)
 }
 
-
 func mustEnv(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
@@ -635,6 +637,23 @@ func main() {
 		targetAWSRegion:  targetAWSRegion,
 		target:           target,
 	}
+
+	// STS クライアントを assumerole エンドポイント用に生成する。
+	// ASSUME_ROLE_ARN を経由せずランタイムロールを直接使う（per-user AssumeRole が目的）。
+	assumeRoleCfg := loadAssumeRoleConfig()
+	stsBaseCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(mcpRegion))
+	if err != nil {
+		slog.Error("failed to load AWS config for STS client", "error", err.Error())
+		os.Exit(1)
+	}
+	stsClient := sts.NewFromConfig(stsBaseCfg)
+
+	// /mcp/assumerole/{account_id}/{role_name} は /mcp より具体的なため
+	// Go 1.22+ の net/http パターンマッチングで自動的に優先される。
+	http.Handle("/mcp/assumerole/{account_id}/{role_name}", auth.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user := idproxy.UserFromContext(r.Context())
+		handleAssumeRoleRequest(w, r, user, assumeRoleCfg, target, stsClient, mcpRegion, targetAWSRegion)
+	})))
 
 	// Log OIDC user identity on every authenticated request for audit traceability.
 	// This enables correlating gateway access logs (who) with CloudTrail (what AWS actions).
