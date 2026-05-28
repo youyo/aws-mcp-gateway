@@ -848,6 +848,10 @@ func handleAssumeRoleRequest(
 	}
 
 	if !isAllowedAssumeRole(cfg, accountID, roleName) {
+		slog.Warn("assumerole forbidden: not in allowlist",
+			"account_id", accountID,
+			"role_name", roleName,
+		)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -859,7 +863,11 @@ func handleAssumeRoleRequest(
 
 	creds, err := getAssumeRoleCredentials(r.Context(), stsClient, accountID, roleName, user.Subject, cfg.maxCacheTTL)
 	if err != nil {
-		slog.Error("getAssumeRoleCredentials failed", "error", err.Error())
+		slog.Error("getAssumeRoleCredentials failed",
+			"error", err.Error(),
+			"account_id", accountID,
+			"role_name", roleName,
+		)
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -869,8 +877,18 @@ func handleAssumeRoleRequest(
 	if _, rerr := creds.Retrieve(r.Context()); rerr != nil {
 		switch classifyFederatedError(rerr) {
 		case federatedErrForbidden:
+			slog.Warn("assumerole sts forbidden",
+				"error", rerr.Error(),
+				"account_id", accountID,
+				"role_name", roleName,
+			)
 			http.Error(w, "forbidden", http.StatusForbidden)
 		default:
+			slog.Warn("assumerole sts error",
+				"error", rerr.Error(),
+				"account_id", accountID,
+				"role_name", roleName,
+			)
 			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		}
 		return
