@@ -30,6 +30,7 @@ AWS 認証情報は環境から自動解決されます（Lambda 実行ロール
 - **SigV4 署名** — Lambda/ECS/EC2 の IAM ロールから自動解決
 - **Streamable HTTP 透過プロキシ** — MCP メッセージをそのまま通過
 - **per-user IAM 分離** — OIDC ユーザーごとの一時認証情報（federated モード）
+- **マルチアカウント AssumeRole ルーティング** — パスベースルーティング（`/mcp/assumerole/accounts/{account_id}/rolename/{role_name}`）により、ゲートウェイを複数デプロイせずに複数の AWS アカウントへの IAM ロール assume が可能
 - **CloudTrail 監査トレーサビリティ**
 - **JSON 構造化ログ** — `log/slog` 経由
 
@@ -61,6 +62,9 @@ AWS 認証情報は環境から自動解決されます（Lambda 実行ロール
 | `DYNAMODB_TABLE` | DynamoDB テーブル名（`STORE_BACKEND=dynamodb` 時は必須） | none |
 | `DYNAMODB_REGION` | DynamoDB テーブルのリージョン（`STORE_BACKEND=dynamodb` 時は必須） | `ap-northeast-1` |
 | `PORT` | Listen ポート | `8080` |
+| `ASSUMEROLE_ALLOWED_ACCOUNTS` | AssumeRole を許可する AWS アカウント ID の一覧（カンマ区切り）。未設定の場合、`/mcp/assumerole/` へのすべてのリクエストは 403 を返す。 | none |
+| `ASSUMEROLE_ALLOWED_ROLE_NAMES` | AssumeRole を許可する IAM ロール名の一覧（カンマ区切り）。未設定の場合、`/mcp/assumerole/` へのすべてのリクエストは 403 を返す。 | none |
+| `ASSUMEROLE_MAX_CACHE_TTL` | AssumeRole クレデンシャルキャッシュの最大 TTL（例: `15m`、`30m`）。デフォルトは `55m`（STS 有効期限 1h - バッファ 5min）。短くするほど IdP revocation への追従が速くなるが STS 呼び出し頻度が増加する。 | `55m` |
 
 > **注:** `AWS_MCP_REGION` は接続する MCP Server エンドポイントのリージョン（`us-east-1` または `eu-central-1`）を制御します。新リージョンが追加されたらこの変数を変更するだけで対応できます。`TARGET_AWS_REGION` は AWS 操作のデフォルトリージョンで、MCP Server のリージョンとは異なっていても構いません。
 
@@ -644,6 +648,81 @@ aws-mcp-gateway
   }
 }
 ```
+
+## マルチアカウント AssumeRole ルーティング
+
+ゲートウェイはパスベースの AssumeRole による複数 AWS アカウントへのルーティングをサポートします:
+
+```
+/mcp/assumerole/accounts/{account_id}/rolename/{role_name}
+```
+
+### 動作の仕組み
+
+1. ゲートウェイが URL パスから `account_id` と `role_name` を抽出する
+2. 両パラメータを検証する（account_id: 12 桁の数字; role_name: IAM 命名規則）
+3. 許可リスト（`ASSUMEROLE_ALLOWED_ACCOUNTS`、`ASSUMEROLE_ALLOWED_ROLE_NAMES`）を確認する
+4. STS `AssumeRole` を呼び出して一時認証情報を取得する
+5. SigV4 署名付きで AWS MCP Server にリクエストをプロキシする
+
+### 必須環境変数
+
+| 変数 | 説明 |
+|------|------|
+| `ASSUMEROLE_ALLOWED_ACCOUNTS` | 許可する AWS アカウント ID の一覧（カンマ区切り、各 12 桁） |
+| `ASSUMEROLE_ALLOWED_ROLE_NAMES` | 許可する IAM ロール名の一覧（カンマ区切り） |
+
+### IAM 要件
+
+ゲートウェイの実行ロールに各ターゲットロールへの `sts:AssumeRole` 権限が必要です:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "sts:AssumeRole",
+  "Resource": "arn:aws:iam::TARGET_ACCOUNT_ID:role/ROLE_NAME"
+}
+```
+
+各ターゲットロールにはゲートウェイのロールを信頼する trust policy が必要です:
+
+```json
+{
+  "Effect": "Allow",
+  "Principal": {
+    "AWS": "arn:aws:iam::GATEWAY_ACCOUNT_ID:role/GATEWAY_ROLE"
+  },
+  "Action": "sts:AssumeRole"
+}
+```
+
+### MCP クライアント設定例
+
+```json
+{
+  "mcpServers": {
+    "aws-account-a": {
+      "url": "https://your-gateway.example.com/mcp/assumerole/accounts/123456789012/rolename/AwsMcpGatewayRole"
+    },
+    "aws-account-b": {
+      "url": "https://your-gateway.example.com/mcp/assumerole/accounts/210987654321/rolename/AwsMcpGatewayRole"
+    }
+  }
+}
+```
+
+### セキュリティ注意事項
+
+- `deny by default`: 許可リストに含まれないアカウント/ロールへのリクエストは 403 を返す
+- クレデンシャルは `(account_id, role_name, user_subject)` の組み合わせごとにキャッシュされ、TTL は設定可能
+- OIDC ユーザーの `sub` が STS セッション名に埋め込まれ、CloudTrail での監査追跡が可能
+
+### IAM_MODE と ASSUME_ROLE_ARN との関係
+
+`/mcp/assumerole/` エンドポイントは `IAM_MODE` の設定に関わらず、**常にゲートウェイのランタイムクレデンシャル**（Lambda 実行ロール、ECS タスクロール、EC2 インスタンスプロファイル等）を使って `sts:AssumeRole` を呼び出します。
+
+- **`IAM_MODE=federated`**: 既存の `/mcp` エンドポイントはユーザーごとの OIDC ID Token を使って `AssumeRoleWithWebIdentity` を行いますが、`/mcp/assumerole/` エンドポイントは ID Token を使いません。ゲートウェイへのアクセス制御（OIDC 認証）は引き続き必須ですが、AWS 認証情報の分離は許可リストとランタイムロールの `sts:AssumeRole` 権限で行います。
+- **`ASSUME_ROLE_ARN`**: この変数は `/mcp` エンドポイントの中継ロール設定のみに影響します。`/mcp/assumerole/` エンドポイントは `ASSUME_ROLE_ARN` を無視し、ランタイムロールから対象ロールへ直接 AssumeRole します。
 
 ## アカウント分離
 

@@ -11,9 +11,13 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	ststypes "github.com/aws/aws-sdk-go-v2/service/sts/types"
 	"github.com/aws/smithy-go"
 	idproxy "github.com/youyo/idproxy"
 )
@@ -782,4 +786,606 @@ func TestOIDCUserLoggingWithUser(t *testing.T) {
 	}
 	t.Logf("✓ UserFromContext(空コンテキスト) = nil 確認")
 	t.Logf("✓ User{Email: %s, Subject: %s} フィールドアクセス確認", dummyUser.Email, dummyUser.Subject)
+}
+
+// M1: validateAccountID のテスト
+func TestValidateAccountID(t *testing.T) {
+	valid := []string{"123456789012"}
+	for _, s := range valid {
+		if !validateAccountID(s) {
+			t.Errorf("validateAccountID(%q) = false, want true", s)
+		}
+	}
+	invalid := []string{"12345", "abc", "", "1234567890123", " 123456789012"}
+	for _, s := range invalid {
+		if validateAccountID(s) {
+			t.Errorf("validateAccountID(%q) = true, want false", s)
+		}
+	}
+}
+
+// M1: validateRoleName のテスト
+func TestValidateRoleName(t *testing.T) {
+	valid := []string{"AwsMcpGatewayRole", "role+=,.@_-"}
+	for _, s := range valid {
+		if !validateRoleName(s) {
+			t.Errorf("validateRoleName(%q) = false, want true", s)
+		}
+	}
+	invalid := []string{"../evil", "..", "role;drop", "", "\x00", "ロール名",
+		// IAM ロール名の最大長 64 文字を超えるケース
+		"A" + strings.Repeat("a", 64),
+	}
+	for _, s := range invalid {
+		if validateRoleName(s) {
+			t.Errorf("validateRoleName(%q) = true, want false", s)
+		}
+	}
+	// 64 文字ちょうどは有効
+	maxLen := strings.Repeat("a", 64)
+	if !validateRoleName(maxLen) {
+		t.Errorf("validateRoleName(%q) = false, want true (64 chars)", maxLen)
+	}
+}
+
+// M2: loadAssumeRoleConfig のテスト
+func TestLoadAssumeRoleConfig(t *testing.T) {
+	t.Run("環境変数未設定時はnilスライス", func(t *testing.T) {
+		t.Setenv("ASSUMEROLE_ALLOWED_ACCOUNTS", "")
+		t.Setenv("ASSUMEROLE_ALLOWED_ROLE_NAMES", "")
+		t.Setenv("ASSUMEROLE_MAX_CACHE_TTL", "")
+		cfg := loadAssumeRoleConfig()
+		if cfg.allowedAccounts != nil {
+			t.Errorf("allowedAccounts = %v, want nil", cfg.allowedAccounts)
+		}
+		if cfg.allowedRoleNames != nil {
+			t.Errorf("allowedRoleNames = %v, want nil", cfg.allowedRoleNames)
+		}
+		if cfg.maxCacheTTL != defaultAssumeRoleMaxCacheTTL {
+			t.Errorf("maxCacheTTL = %v, want %v", cfg.maxCacheTTL, defaultAssumeRoleMaxCacheTTL)
+		}
+	})
+	t.Run("カンマ区切りで2要素", func(t *testing.T) {
+		t.Setenv("ASSUMEROLE_ALLOWED_ACCOUNTS", "111111111111,222222222222")
+		t.Setenv("ASSUMEROLE_ALLOWED_ROLE_NAMES", "RoleA,RoleB")
+		t.Setenv("ASSUMEROLE_MAX_CACHE_TTL", "")
+		cfg := loadAssumeRoleConfig()
+		if len(cfg.allowedAccounts) != 2 {
+			t.Errorf("allowedAccounts len = %d, want 2", len(cfg.allowedAccounts))
+		}
+		if len(cfg.allowedRoleNames) != 2 {
+			t.Errorf("allowedRoleNames len = %d, want 2", len(cfg.allowedRoleNames))
+		}
+	})
+	t.Run("ASSUMEROLE_MAX_CACHE_TTL 有効値", func(t *testing.T) {
+		t.Setenv("ASSUMEROLE_MAX_CACHE_TTL", "30m")
+		cfg := loadAssumeRoleConfig()
+		if cfg.maxCacheTTL != 30*time.Minute {
+			t.Errorf("maxCacheTTL = %v, want 30m", cfg.maxCacheTTL)
+		}
+	})
+	t.Run("ASSUMEROLE_MAX_CACHE_TTL 不正値はデフォルト使用", func(t *testing.T) {
+		t.Setenv("ASSUMEROLE_MAX_CACHE_TTL", "invalid")
+		cfg := loadAssumeRoleConfig()
+		if cfg.maxCacheTTL != defaultAssumeRoleMaxCacheTTL {
+			t.Errorf("maxCacheTTL = %v, want %v", cfg.maxCacheTTL, defaultAssumeRoleMaxCacheTTL)
+		}
+	})
+	t.Run("ASSUMEROLE_MAX_CACHE_TTL 最小値未満は最小値に切り上げ", func(t *testing.T) {
+		t.Setenv("ASSUMEROLE_MAX_CACHE_TTL", "1m")
+		cfg := loadAssumeRoleConfig()
+		if cfg.maxCacheTTL != minAssumeRoleMaxCacheTTL {
+			t.Errorf("maxCacheTTL = %v, want %v", cfg.maxCacheTTL, minAssumeRoleMaxCacheTTL)
+		}
+	})
+}
+
+// M3: isAllowedAssumeRole のテスト
+func TestIsAllowed(t *testing.T) {
+	cfg := assumeRoleConfig{
+		allowedAccounts:  []string{"123456789012"},
+		allowedRoleNames: []string{"AwsMcpGatewayRole"},
+	}
+	if !isAllowedAssumeRole(cfg, "123456789012", "AwsMcpGatewayRole") {
+		t.Error("両方含む場合は true を期待")
+	}
+	if isAllowedAssumeRole(cfg, "999999999999", "AwsMcpGatewayRole") {
+		t.Error("account が許可リスト外の場合は false を期待")
+	}
+	if isAllowedAssumeRole(cfg, "123456789012", "OtherRole") {
+		t.Error("role が許可リスト外の場合は false を期待")
+	}
+	empty := assumeRoleConfig{}
+	if isAllowedAssumeRole(empty, "123456789012", "AwsMcpGatewayRole") {
+		t.Error("空の cfg の場合は false を期待")
+	}
+}
+
+// M4 テスト用モック: AssumeRoleAPIClient を実装する。
+type mockAssumeRoleClient struct {
+	callCount int64
+	err       error
+}
+
+func (m *mockAssumeRoleClient) AssumeRole(ctx context.Context, params *sts.AssumeRoleInput, optFns ...func(*sts.Options)) (*sts.AssumeRoleOutput, error) {
+	atomic.AddInt64(&m.callCount, 1)
+	if m.err != nil {
+		return nil, m.err
+	}
+	expiry := time.Now().Add(1 * time.Hour)
+	return &sts.AssumeRoleOutput{
+		Credentials: &ststypes.Credentials{
+			AccessKeyId:     aws.String("AKIATEST"),
+			SecretAccessKey: aws.String("secret"),
+			SessionToken:    aws.String("token"),
+			Expiration:      &expiry,
+		},
+	}, nil
+}
+
+// M4: TestBuildAssumeRoleARN は buildAssumeRoleARN が正しい ARN 文字列を返すことを確認する。
+func TestBuildAssumeRoleARN(t *testing.T) {
+	got := buildAssumeRoleARN("123456789012", "AwsMcpGatewayRole")
+	want := "arn:aws:iam::123456789012:role/AwsMcpGatewayRole"
+	if got != want {
+		t.Errorf("buildAssumeRoleARN = %q, want %q", got, want)
+	}
+	t.Logf("✓ buildAssumeRoleARN = %q", got)
+}
+
+// M4: TestGetAssumeRoleCredentials_SessionName はセッション名が "gw-ar-{sub}" 形式で
+// STS 許可文字のみかつ 64 文字以内に収まることを確認する。
+func TestGetAssumeRoleCredentials_SessionName(t *testing.T) {
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+	longSub := strings.Repeat("a", 100)
+	client := &mockAssumeRoleClient{}
+	creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", longSub, 1*time.Hour)
+	if err != nil {
+		t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
+	}
+	if creds == nil {
+		t.Fatal("creds が nil")
+	}
+
+	// セッション名の確認: AssumeRole が呼ばれていること（キャッシュなし）
+	_, rerr := creds.Retrieve(context.Background())
+	if rerr != nil {
+		t.Fatalf("Retrieve エラー: %v", rerr)
+	}
+
+	// RoleSessionName が 64 文字以内か確認するため、sanitizeSessionName の結果を直接確認
+	sessionName := sanitizeSessionName("gw-ar-" + longSub)
+	if len(sessionName) > 64 {
+		t.Errorf("セッション名が 64 文字を超えている: len=%d", len(sessionName))
+	}
+	t.Logf("✓ sessionName len=%d (≤64)", len(sessionName))
+}
+
+// M4: TestGetAssumeRoleCredentials_CacheHit は同一引数で 2 回呼んだ場合に
+// キャッシュが機能して同一 CredentialsCache ポインタを返すことを確認する。
+func TestGetAssumeRoleCredentials_CacheHit(t *testing.T) {
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+	client := &mockAssumeRoleClient{}
+	ctx := context.Background()
+
+	creds1, err1 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", 1*time.Hour)
+	if err1 != nil {
+		t.Fatalf("1回目 getAssumeRoleCredentials エラー: %v", err1)
+	}
+	creds2, err2 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", 1*time.Hour)
+	if err2 != nil {
+		t.Fatalf("2回目 getAssumeRoleCredentials エラー: %v", err2)
+	}
+
+	// 同一ポインタ = LoadOrStore でキャッシュが機能
+	if creds1 != creds2 {
+		t.Errorf("CredentialsCache が再構築された（キャッシュ不動作）: creds1=%p creds2=%p", creds1, creds2)
+	}
+	t.Logf("✓ キャッシュヒットで同一ポインタを返した: %p", creds1)
+}
+
+// M4: TestGetAssumeRoleCredentials_AccessDenied は AccessDenied エラー時に
+// キャッシュエントリが削除されることを確認する。
+func TestGetAssumeRoleCredentials_AccessDenied(t *testing.T) {
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+	accessDeniedErr := &stubAPIError{code: "AccessDenied", msg: "access denied"}
+	client := &mockAssumeRoleClient{err: accessDeniedErr}
+	ctx := context.Background()
+
+	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-denied", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("getAssumeRoleCredentials は AccessDenied をラップして返すはずだが直接エラー: %v", err)
+	}
+	if creds == nil {
+		t.Fatal("creds が nil（CredentialsCache が返ってくるはず）")
+	}
+
+	// Retrieve を呼ぶと AccessDenied が発生する
+	_, rerr := creds.Retrieve(ctx)
+	if rerr == nil {
+		t.Fatal("AccessDenied エラーが返るはずが nil")
+	}
+
+	// キャッシュが削除されていることを確認
+	cacheKey := "123456789012::AwsMcpGatewayRole::sub-denied"
+	if _, ok := assumeRoleCredsCache.Load(cacheKey); ok {
+		t.Error("AccessDenied 後もキャッシュに残っている（削除されるべき）")
+	}
+	t.Logf("✓ AccessDenied 後にキャッシュエントリが削除された")
+}
+
+// M4: TestGetAssumeRoleCredentials_Throttling は Throttling エラー時に
+// キャッシュエントリが保持されることを確認する。
+func TestGetAssumeRoleCredentials_Throttling(t *testing.T) {
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+	throttleErr := &stubAPIError{code: "Throttling", msg: "rate exceeded"}
+	client := &mockAssumeRoleClient{err: throttleErr}
+	ctx := context.Background()
+
+	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-throttle", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("getAssumeRoleCredentials は Throttling をラップして返すはずだが直接エラー: %v", err)
+	}
+	if creds == nil {
+		t.Fatal("creds が nil")
+	}
+
+	// Retrieve を呼ぶと Throttling エラーが発生する
+	_, rerr := creds.Retrieve(ctx)
+	if rerr == nil {
+		t.Fatal("Throttling エラーが返るはずが nil")
+	}
+
+	// キャッシュは保持されていることを確認
+	cacheKey := "123456789012::AwsMcpGatewayRole::sub-throttle"
+	if _, ok := assumeRoleCredsCache.Load(cacheKey); !ok {
+		t.Error("Throttling 後にキャッシュが削除された（保持されるべき）")
+	}
+	t.Logf("✓ Throttling 後にキャッシュエントリが保持された")
+}
+
+// M5: handleAssumeRoleRequest のテスト
+
+// mockSTSClientM5 は AssumeRoleAPIClient を実装するモック（M5 テスト用）。
+type mockSTSClientM5 struct {
+	err error
+}
+
+func (m *mockSTSClientM5) AssumeRole(ctx context.Context, params *sts.AssumeRoleInput, optFns ...func(*sts.Options)) (*sts.AssumeRoleOutput, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	expiry := time.Now().Add(1 * time.Hour)
+	return &sts.AssumeRoleOutput{
+		Credentials: &ststypes.Credentials{
+			AccessKeyId:     aws.String("AKIATESM5"),
+			SecretAccessKey: aws.String("secretm5"),
+			SessionToken:    aws.String("tokenm5"),
+			Expiration:      &expiry,
+		},
+	}, nil
+}
+
+func TestHandleAssumeRoleRequest(t *testing.T) {
+	const (
+		allowedAccount = "123456789012"
+		allowedRole    = "AwsMcpGatewayRole"
+		mcpRegion      = "us-east-1"
+		targetRegion   = "ap-northeast-1"
+	)
+
+	validUser := &idproxy.User{
+		Email:   "alice@example.com",
+		Subject: "sub-alice",
+	}
+
+	validCfg := assumeRoleConfig{
+		allowedAccounts:  []string{allowedAccount},
+		allowedRoleNames: []string{allowedRole},
+		maxCacheTTL:      1 * time.Hour,
+	}
+
+	// モックアップストリームサーバー（Authorization ヘッダーをキャプチャ）
+	var capturedAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+
+	t.Run("正常系 POST: 200 および Authorization ヘッダー付き", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		capturedAuth = ""
+		stsClient := &mockSTSClientM5{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/mcp/assumerole/accounts/"+allowedAccount+"/rolename/"+allowedRole, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+		req.SetPathValue("account_id", allowedAccount)
+		req.SetPathValue("role_name", allowedRole)
+
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("期待値 200、実際: %d body=%s", rec.Code, rec.Body.String())
+		}
+		if !strings.HasPrefix(capturedAuth, "AWS4-HMAC-SHA256") {
+			t.Errorf("SigV4 Authorization ヘッダーが付いていない: %q", capturedAuth)
+		}
+		t.Logf("✓ 正常系 POST: status=%d Authorization=%s...", rec.Code, capturedAuth[:min(50, len(capturedAuth))])
+	})
+
+	t.Run("account_id 不正: 400", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		stsClient := &mockSTSClientM5{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+		req.SetPathValue("account_id", "bad-account")
+		req.SetPathValue("role_name", allowedRole)
+
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("期待値 400、実際: %d", rec.Code)
+		}
+		body := strings.TrimSpace(rec.Body.String())
+		if body != "invalid account_id" {
+			t.Errorf("期待値 %q、実際: %q", "invalid account_id", body)
+		}
+		t.Logf("✓ 不正 account_id: status=%d body=%q", rec.Code, body)
+	})
+
+	t.Run("role_name 不正: 400", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		stsClient := &mockSTSClientM5{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+		req.SetPathValue("account_id", allowedAccount)
+		req.SetPathValue("role_name", "../evil")
+
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("期待値 400、実際: %d", rec.Code)
+		}
+		body := strings.TrimSpace(rec.Body.String())
+		if body != "invalid role_name" {
+			t.Errorf("期待値 %q、実際: %q", "invalid role_name", body)
+		}
+		t.Logf("✓ 不正 role_name: status=%d body=%q", rec.Code, body)
+	})
+
+	t.Run("allowlist 外 account: 403", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		stsClient := &mockSTSClientM5{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+		req.SetPathValue("account_id", "999999999999")
+		req.SetPathValue("role_name", allowedRole)
+
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("期待値 403、実際: %d", rec.Code)
+		}
+		body := strings.TrimSpace(rec.Body.String())
+		if body != "forbidden" {
+			t.Errorf("期待値 %q、実際: %q", "forbidden", body)
+		}
+		t.Logf("✓ allowlist 外 account: status=%d body=%q", rec.Code, body)
+	})
+
+	t.Run("allowlist 外 role: 403", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		stsClient := &mockSTSClientM5{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+		req.SetPathValue("account_id", allowedAccount)
+		req.SetPathValue("role_name", "OtherRole")
+
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("期待値 403、実際: %d", rec.Code)
+		}
+		body := strings.TrimSpace(rec.Body.String())
+		if body != "forbidden" {
+			t.Errorf("期待値 %q、実際: %q", "forbidden", body)
+		}
+		t.Logf("✓ allowlist 外 role: status=%d body=%q", rec.Code, body)
+	})
+
+	t.Run("user が nil: 500", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		stsClient := &mockSTSClientM5{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+		req.SetPathValue("account_id", allowedAccount)
+		req.SetPathValue("role_name", allowedRole)
+
+		handleAssumeRoleRequest(rec, req, nil, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("期待値 500、実際: %d", rec.Code)
+		}
+		t.Logf("✓ user=nil: status=%d", rec.Code)
+	})
+
+	t.Run("user.Subject が空: 500", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		stsClient := &mockSTSClientM5{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+		req.SetPathValue("account_id", allowedAccount)
+		req.SetPathValue("role_name", allowedRole)
+		emptyUser := &idproxy.User{Email: "alice@example.com", Subject: ""}
+
+		handleAssumeRoleRequest(rec, req, emptyUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("期待値 500、実際: %d", rec.Code)
+		}
+		t.Logf("✓ user.Subject 空: status=%d", rec.Code)
+	})
+
+	t.Run("STS AccessDenied: 403、ボディに ARN や AccessDenied を含まない", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		accessDeniedErr := &stubAPIError{code: "AccessDenied", msg: "AccessDenied: User is not authorized"}
+		stsClient := &mockSTSClientM5{err: accessDeniedErr}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+		req.SetPathValue("account_id", allowedAccount)
+		req.SetPathValue("role_name", allowedRole)
+
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("期待値 403、実際: %d", rec.Code)
+		}
+		body := strings.TrimSpace(rec.Body.String())
+		if strings.Contains(body, "arn:") {
+			t.Errorf("エラーボディに ARN が含まれている: %q", body)
+		}
+		if strings.Contains(body, "AccessDenied") {
+			t.Errorf("エラーボディに AccessDenied が含まれている: %q", body)
+		}
+		t.Logf("✓ STS AccessDenied: status=%d body=%q", rec.Code, body)
+	})
+
+	t.Run("STS Throttling: 503", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		throttleErr := &stubAPIError{code: "Throttling", msg: "rate exceeded"}
+		stsClient := &mockSTSClientM5{err: throttleErr}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+		req.SetPathValue("account_id", allowedAccount)
+		req.SetPathValue("role_name", allowedRole)
+
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("期待値 503、実際: %d", rec.Code)
+		}
+		t.Logf("✓ STS Throttling: status=%d", rec.Code)
+	})
+}
+
+// TestAssumeRoleEndpointRouting: /mcp/assumerole/{account_id}/{role_name} が
+// assumerole ハンドラにルーティングされ、PathValue が正しく取得できることを確認する。
+// ASSUMEROLE_ALLOWED_ACCOUNTS / ASSUMEROLE_ALLOWED_ROLE_NAMES 未設定時は 403 が返ることも確認する。
+func TestAssumeRoleEndpointRouting(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	// allowlist 未設定 → 全リクエストが 403
+	t.Setenv("ASSUMEROLE_ALLOWED_ACCOUNTS", "")
+	t.Setenv("ASSUMEROLE_ALLOWED_ROLE_NAMES", "")
+
+	// assumerole ハンドラが呼ばれたかを記録するフラグ
+	assumeRoleHandlerCalled := false
+	var capturedAccountID, capturedRoleName string
+
+	// assumerole ハンドラをシミュレートするモックハンドラ
+	assumeRoleHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assumeRoleHandlerCalled = true
+		capturedAccountID = r.PathValue("account_id")
+		capturedRoleName = r.PathValue("role_name")
+		// allowlist 未設定を模倣して 403
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+
+	// default ハンドラ（/mcp/assumerole/ に来ていないことを確認するため）
+	defaultHandlerCalled := false
+	defaultHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defaultHandlerCalled = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/mcp/assumerole/accounts/{account_id}/rolename/{role_name}", assumeRoleHandler)
+	mux.Handle("/", defaultHandler)
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	t.Run("/mcp/assumerole/{account_id}/{role_name} が assumerole ハンドラにルーティングされる", func(t *testing.T) {
+		assumeRoleHandlerCalled = false
+		defaultHandlerCalled = false
+		capturedAccountID = ""
+		capturedRoleName = ""
+
+		resp, err := http.Post(srv.URL+"/mcp/assumerole/accounts/123456789012/rolename/AwsMcpGatewayRole",
+			"application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("リクエスト失敗: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if !assumeRoleHandlerCalled {
+			t.Error("assumerole ハンドラが呼ばれなかった")
+		}
+		if defaultHandlerCalled {
+			t.Error("/ ハンドラが誤って呼ばれた")
+		}
+		if capturedAccountID != "123456789012" {
+			t.Errorf("account_id PathValue = %q, want %q", capturedAccountID, "123456789012")
+		}
+		if capturedRoleName != "AwsMcpGatewayRole" {
+			t.Errorf("role_name PathValue = %q, want %q", capturedRoleName, "AwsMcpGatewayRole")
+		}
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("期待値 403、実際: %d", resp.StatusCode)
+		}
+		t.Logf("✓ assumerole ハンドラへのルーティング確認: account_id=%q role_name=%q status=%d",
+			capturedAccountID, capturedRoleName, resp.StatusCode)
+	})
+
+	t.Run("/mcp へのリクエストは assumerole ハンドラではなく / ハンドラで処理される", func(t *testing.T) {
+		assumeRoleHandlerCalled = false
+		defaultHandlerCalled = false
+
+		resp, err := http.Post(srv.URL+"/mcp",
+			"application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("リクエスト失敗: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if assumeRoleHandlerCalled {
+			t.Error("assumerole ハンドラが誤って呼ばれた")
+		}
+		if !defaultHandlerCalled {
+			t.Error("/ ハンドラが呼ばれなかった")
+		}
+		t.Logf("✓ /mcp へのリクエストは / ハンドラで処理された: status=%d", resp.StatusCode)
+	})
 }

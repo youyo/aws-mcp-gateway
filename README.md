@@ -30,6 +30,7 @@ AWS credentials are resolved automatically from the environment (Lambda executio
 - **SigV4 signing** — automatic credential resolution from IAM roles
 - **Streamable HTTP transparent proxy** — MCP messages pass through unchanged
 - **Per-AWS-account isolation** — deploy one instance per account with its own IAM role
+- **Multi-account AssumeRole routing** — path-based routing (`/mcp/assumerole/accounts/{account_id}/rolename/{role_name}`) to assume IAM roles across multiple AWS accounts without deploying separate gateways
 - **JSON structured logging** via `log/slog`
 
 ## Environment Variables
@@ -60,6 +61,9 @@ AWS credentials are resolved automatically from the environment (Lambda executio
 | `DYNAMODB_TABLE` | DynamoDB table name (required when `STORE_BACKEND=dynamodb`) | none |
 | `DYNAMODB_REGION` | DynamoDB table region (required when `STORE_BACKEND=dynamodb`) | `ap-northeast-1` |
 | `PORT` | Listen port | `8080` |
+| `ASSUMEROLE_ALLOWED_ACCOUNTS` | Comma-separated list of allowed AWS account IDs (12 digits each) for AssumeRole path routing. If unset, all requests to `/mcp/assumerole/` return 403. | none |
+| `ASSUMEROLE_ALLOWED_ROLE_NAMES` | Comma-separated list of allowed IAM role names for AssumeRole path routing. If unset, all requests to `/mcp/assumerole/` return 403. | none |
+| `ASSUMEROLE_MAX_CACHE_TTL` | Maximum TTL for AssumeRole credential cache (e.g. `15m`, `30m`). Default is `55m` (STS 1h expiry minus 5min buffer). Shorter values improve IdP revocation responsiveness at the cost of more frequent STS calls. | `55m` |
 
 > **Note:** `AWS_MCP_REGION` controls which MCP server endpoint to connect to (`us-east-1` or `eu-central-1`). When a new region becomes available, just change this variable. `TARGET_AWS_REGION` sets the default region for AWS operations — these can be different.
 
@@ -592,6 +596,81 @@ aws-mcp-gateway
   }
 }
 ```
+
+## Multi-Account AssumeRole Routing
+
+The gateway supports routing requests to multiple AWS accounts via path-based AssumeRole:
+
+```
+/mcp/assumerole/accounts/{account_id}/rolename/{role_name}
+```
+
+### How it works
+
+1. The gateway extracts `account_id` and `role_name` from the URL path
+2. Validates both parameters (account_id: 12 digits; role_name: IAM naming rules)
+3. Checks against the allowlist (`ASSUMEROLE_ALLOWED_ACCOUNTS`, `ASSUMEROLE_ALLOWED_ROLE_NAMES`)
+4. Calls STS `AssumeRole` to get temporary credentials
+5. Proxies the request to AWS MCP Server with SigV4 signing
+
+### Required environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `ASSUMEROLE_ALLOWED_ACCOUNTS` | Comma-separated list of allowed AWS account IDs (12 digits each) |
+| `ASSUMEROLE_ALLOWED_ROLE_NAMES` | Comma-separated list of allowed IAM role names |
+
+### IAM requirements
+
+The gateway's execution role needs `sts:AssumeRole` permission on each target role:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "sts:AssumeRole",
+  "Resource": "arn:aws:iam::TARGET_ACCOUNT_ID:role/ROLE_NAME"
+}
+```
+
+Each target role needs a trust policy allowing the gateway's role:
+
+```json
+{
+  "Effect": "Allow",
+  "Principal": {
+    "AWS": "arn:aws:iam::GATEWAY_ACCOUNT_ID:role/GATEWAY_ROLE"
+  },
+  "Action": "sts:AssumeRole"
+}
+```
+
+### MCP client configuration example
+
+```json
+{
+  "mcpServers": {
+    "aws-account-a": {
+      "url": "https://your-gateway.example.com/mcp/assumerole/accounts/123456789012/rolename/AwsMcpGatewayRole"
+    },
+    "aws-account-b": {
+      "url": "https://your-gateway.example.com/mcp/assumerole/accounts/210987654321/rolename/AwsMcpGatewayRole"
+    }
+  }
+}
+```
+
+### Security notes
+
+- `deny by default`: requests to unlisted accounts/roles return 403
+- Credentials are cached per `(account_id, role_name, user_subject)` with configurable TTL
+- The OIDC user's `sub` is embedded in the STS session name for CloudTrail auditability
+
+### Interaction with IAM_MODE and ASSUME_ROLE_ARN
+
+The `/mcp/assumerole/` endpoint **always uses the gateway's runtime credentials** (Lambda execution role, ECS task role, EC2 instance profile, etc.) to call `sts:AssumeRole`, regardless of `IAM_MODE`.
+
+- **`IAM_MODE=federated`**: The existing `/mcp` endpoint uses per-user OIDC ID Tokens for `AssumeRoleWithWebIdentity`. The `/mcp/assumerole/` endpoint does **not** use the ID Token — it calls `AssumeRole` from the runtime role. OIDC authentication (gateway login) is still required, but AWS credential isolation is handled by the allowlist and the runtime role's `sts:AssumeRole` permissions, not by per-user OIDC credentials.
+- **`ASSUME_ROLE_ARN`**: This variable configures an intermediate role for the `/mcp` endpoint only. The `/mcp/assumerole/` endpoint ignores `ASSUME_ROLE_ARN` and assumes the target role directly from the runtime role.
 
 ## Per-Account Isolation
 

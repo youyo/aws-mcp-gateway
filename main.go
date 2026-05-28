@@ -1,13 +1,14 @@
 // aws-mcp-gateway: OIDC-authenticated reverse proxy for AWS MCP Server.
 //
 // Architecture:
-//   MCP Client (Claude Code etc.)
-//     ↓ OAuth 2.1 (Bearer Token)
-//   idproxy (EntraID OIDC auth)
-//     ↓ upstream HTTP
-//   httputil.ReverseProxy + SigV4 RoundTripper
-//     ↓ Streamable HTTP + SigV4
-//   AWS MCP Server (managed)
+//
+//	MCP Client (Claude Code etc.)
+//	  ↓ OAuth 2.1 (Bearer Token)
+//	idproxy (EntraID OIDC auth)
+//	  ↓ upstream HTTP
+//	httputil.ReverseProxy + SigV4 RoundTripper
+//	  ↓ Streamable HTTP + SigV4
+//	AWS MCP Server (managed)
 //
 // AWS credentials are resolved automatically from the environment
 // (Lambda execution role, ECS task role, EC2 instance profile, etc.)
@@ -31,6 +32,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -161,7 +163,9 @@ func tokenFingerprint(idToken string) string {
 // per-user SigV4 RoundTripper を返す。同一トークンでの二回目以降は STS 呼び出しなし。
 //
 // assumeRoleARN が空でない場合はロールチェーンを構成する:
-//   OIDC IDToken → roleARN (AssumeRoleWithWebIdentity) → assumeRoleARN (AssumeRole)
+//
+//	OIDC IDToken → roleARN (AssumeRoleWithWebIdentity) → assumeRoleARN (AssumeRole)
+//
 // ユーザー別の CloudTrail 追跡（RoleSessionName = gw-{sub}）は roleARN の
 // セッション名で引き続き機能する。
 func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idToken, sub, assumeRoleARN string) (*sigV4RoundTripper, error) {
@@ -496,7 +500,6 @@ func handleFederatedRequest(w http.ResponseWriter, r *http.Request, user *idprox
 	buildProxy(cfg.target, federatedTransport).ServeHTTP(w, r)
 }
 
-
 func mustEnv(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
@@ -635,6 +638,29 @@ func main() {
 		target:           target,
 	}
 
+	// STS クライアントを assumerole エンドポイント用に生成する。
+	// 設計上の決定:
+	//   - IAM_MODE (shared/federated) に関わらず、ランタイムロール（実行環境の credentials）から
+	//     直接 AssumeRole する。federated モードの per-user OIDC 認証情報は使わない。
+	//   - ASSUME_ROLE_ARN も使わない。assumerole エンドポイントはパスで指定した
+	//     account_id/role_name への AssumeRole が目的であり、中継ロールは不要。
+	//   - OIDC 認証（auth.Wrap）は必須。ゲートウェイへのアクセス制御は idproxy が担保する。
+	//     AWS 権限分離はランタイムロールの sts:AssumeRole 権限と allowlist で行う。
+	assumeRoleCfg := loadAssumeRoleConfig()
+	stsBaseCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(mcpRegion))
+	if err != nil {
+		slog.Error("failed to load AWS config for STS client", "error", err.Error())
+		os.Exit(1)
+	}
+	stsClient := sts.NewFromConfig(stsBaseCfg)
+
+	// /mcp/assumerole/accounts/{account_id}/rolename/{role_name} は /mcp より具体的なため
+	// Go 1.22+ の net/http パターンマッチングで自動的に優先される。
+	http.Handle("/mcp/assumerole/accounts/{account_id}/rolename/{role_name}", auth.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user := idproxy.UserFromContext(r.Context())
+		handleAssumeRoleRequest(w, r, user, assumeRoleCfg, target, stsClient, mcpRegion, targetAWSRegion)
+	})))
+
 	// Log OIDC user identity on every authenticated request for audit traceability.
 	// This enables correlating gateway access logs (who) with CloudTrail (what AWS actions).
 	loggingProxy := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -687,6 +713,263 @@ func main() {
 		slog.Error("server error", "error", err.Error())
 		os.Exit(1)
 	}
+}
+
+// assumeRoleCacheEntry はキャッシュエントリの作成時刻付きラッパー。
+// maxCacheTTL 経過後は強制的に再作成してメモリリークを防ぐ。
+type assumeRoleCacheEntry struct {
+	creds     *aws.CredentialsCache
+	createdAt time.Time
+}
+
+// assumeRoleCredsCache はユーザー×ロールごとの *assumeRoleCacheEntry をキャッシュする。
+// キー: "{account_id}::{role_name}::{subject}"
+var assumeRoleCredsCache sync.Map
+
+// buildAssumeRoleARN は accountID と roleName から IAM ロール ARN を生成する。
+func buildAssumeRoleARN(accountID, roleName string) string {
+	return fmt.Sprintf("arn:aws:iam::%s:role/%s", accountID, roleName)
+}
+
+// getAssumeRoleCredentials は (accountID, roleName, sub) をキーに CredentialsCache をキャッシュし、
+// AssumeRole による per-user クレデンシャルを返す。
+// maxCacheTTL 経過後はエントリを削除して再作成する（メモリリーク防止）。
+// AccessDenied 時はキャッシュエントリを削除してエラーを返す。
+// Throttling 等の transient エラー時はキャッシュを保持してエラーを返す。
+func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRoleAPIClient, accountID, roleName, sub string, maxTTL time.Duration) (*aws.CredentialsCache, error) {
+	cacheKey := accountID + "::" + roleName + "::" + sub
+
+	if cached, ok := assumeRoleCredsCache.Load(cacheKey); ok {
+		entry := cached.(*assumeRoleCacheEntry)
+		if time.Since(entry.createdAt) < maxTTL {
+			return entry.creds, nil
+		}
+		// CompareAndDelete で TOCTOU を防ぐ: 自分が読んだエントリと同一の場合のみ削除。
+		assumeRoleCredsCache.CompareAndDelete(cacheKey, cached)
+	}
+
+	roleARN := buildAssumeRoleARN(accountID, roleName)
+	sessionName := sanitizeSessionName("gw-ar-" + sub)
+
+	// STS セッション期間はデフォルト（1 時間）を使用する。
+	// maxTTL はローカルキャッシュの退避 TTL であり STS セッション期間とは独立。
+	// o.Duration を maxTTL に設定すると STS 最小 Duration（900 秒）を下回る可能性がある。
+	provider := stscreds.NewAssumeRoleProvider(stsClient, roleARN, func(o *stscreds.AssumeRoleOptions) {
+		o.RoleSessionName = sessionName
+	})
+
+	// エビクションロジックを組み込んだ provider でラップした CredentialsCache をキャッシュする。
+	evictingProvider := credentialsProviderFunc(func(innerCtx context.Context) (aws.Credentials, error) {
+		c, err := provider.Retrieve(innerCtx)
+		if err != nil {
+			if classifyFederatedError(err) != federatedErrTransient {
+				assumeRoleCredsCache.Delete(cacheKey)
+			}
+			return aws.Credentials{}, err
+		}
+		return c, nil
+	})
+
+	newEntry := &assumeRoleCacheEntry{
+		// ExpiryWindow: STS トークン有効期限の 5 分前に自動更新を試みる。
+		creds: aws.NewCredentialsCache(evictingProvider, func(o *aws.CredentialsCacheOptions) {
+			o.ExpiryWindow = 5 * time.Minute
+		}),
+		createdAt: time.Now(),
+	}
+	actual, _ := assumeRoleCredsCache.LoadOrStore(cacheKey, newEntry)
+	return actual.(*assumeRoleCacheEntry).creds, nil
+}
+
+// credentialsProviderFunc は関数を aws.CredentialsProvider として使えるようにするアダプタ。
+type credentialsProviderFunc func(ctx context.Context) (aws.Credentials, error)
+
+func (f credentialsProviderFunc) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	return f(ctx)
+}
+
+var (
+	reAccountID = regexp.MustCompile(`^[0-9]{12}$`)
+	reRoleName  = regexp.MustCompile(`^[A-Za-z0-9+=,.@_-]+$`)
+)
+
+func validateAccountID(s string) bool { return reAccountID.MatchString(s) }
+func validateRoleName(s string) bool {
+	// IAM ロール名の最大長は 64 文字。
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	if strings.Contains(s, "..") {
+		return false
+	}
+	return reRoleName.MatchString(s)
+}
+
+type assumeRoleConfig struct {
+	allowedAccounts  []string
+	allowedRoleNames []string
+	maxCacheTTL      time.Duration
+}
+
+const (
+	defaultAssumeRoleMaxCacheTTL = 55 * time.Minute
+	minAssumeRoleMaxCacheTTL     = 5 * time.Minute
+)
+
+func loadAssumeRoleConfig() assumeRoleConfig {
+	cfg := assumeRoleConfig{
+		allowedAccounts:  splitCSV(os.Getenv("ASSUMEROLE_ALLOWED_ACCOUNTS")),
+		allowedRoleNames: splitCSV(os.Getenv("ASSUMEROLE_ALLOWED_ROLE_NAMES")),
+		maxCacheTTL:      defaultAssumeRoleMaxCacheTTL,
+	}
+	if raw := os.Getenv("ASSUMEROLE_MAX_CACHE_TTL"); raw != "" {
+		if d, err := time.ParseDuration(raw); err != nil {
+			slog.Error("invalid ASSUMEROLE_MAX_CACHE_TTL, using default", "value", raw, "err", err, "default", defaultAssumeRoleMaxCacheTTL)
+		} else if d < minAssumeRoleMaxCacheTTL {
+			slog.Warn("ASSUMEROLE_MAX_CACHE_TTL too short, using minimum", "value", d, "min", minAssumeRoleMaxCacheTTL)
+			cfg.maxCacheTTL = minAssumeRoleMaxCacheTTL
+		} else {
+			cfg.maxCacheTTL = d
+		}
+	}
+	if len(cfg.allowedAccounts) == 0 || len(cfg.allowedRoleNames) == 0 {
+		slog.Warn("ASSUMEROLE_ALLOWED_ACCOUNTS or ASSUMEROLE_ALLOWED_ROLE_NAMES is not set; all /mcp/assumerole/ requests will be denied")
+	}
+	return cfg
+}
+
+func isAllowedAssumeRole(cfg assumeRoleConfig, accountID, roleName string) bool {
+	if len(cfg.allowedAccounts) == 0 || len(cfg.allowedRoleNames) == 0 {
+		return false
+	}
+	accountOK := false
+	for _, a := range cfg.allowedAccounts {
+		if a == accountID {
+			accountOK = true
+			break
+		}
+	}
+	if !accountOK {
+		return false
+	}
+	for _, r := range cfg.allowedRoleNames {
+		if r == roleName {
+			return true
+		}
+	}
+	return false
+}
+
+// handleAssumeRoleRequest は /mcp/assumerole/accounts/{account_id}/rolename/{role_name} へのリクエストを処理する。
+// バリデーション → allowlist 認可 → STS AssumeRole → SigV4 署名プロキシ の順で処理する。
+// エラーレスポンスには内部詳細（ARN、STS エラー文字列）を含めない（fail-closed）。
+func handleAssumeRoleRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+	user *idproxy.User,
+	cfg assumeRoleConfig,
+	target *url.URL,
+	stsClient stscreds.AssumeRoleAPIClient,
+	mcpRegion string,
+	targetAWSRegion string,
+) {
+	accountID := r.PathValue("account_id")
+	roleName := r.PathValue("role_name")
+
+	if !validateAccountID(accountID) {
+		slog.Warn("assumerole invalid account_id", "account_id", accountID)
+		http.Error(w, "invalid account_id", http.StatusBadRequest)
+		return
+	}
+	if !validateRoleName(roleName) {
+		slog.Warn("assumerole invalid role_name", "role_name", roleName)
+		http.Error(w, "invalid role_name", http.StatusBadRequest)
+		return
+	}
+
+	if user == nil || user.Subject == "" {
+		slog.Error("assumerole missing user subject",
+			"account_id", accountID,
+			"role_name", roleName,
+		)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if !isAllowedAssumeRole(cfg, accountID, roleName) {
+		slog.Warn("assumerole forbidden: not in allowlist",
+			"account_id", accountID,
+			"role_name", roleName,
+		)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	creds, err := getAssumeRoleCredentials(r.Context(), stsClient, accountID, roleName, user.Subject, cfg.maxCacheTTL)
+	if err != nil {
+		slog.Error("getAssumeRoleCredentials failed",
+			"error", err.Error(),
+			"account_id", accountID,
+			"role_name", roleName,
+		)
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	// STS は Retrieve() 時に実際に呼ばれる。事前取得でエラーを HTTP ステータスへ変換する。
+	// CredentialsCache が結果をキャッシュするため、proxy 内の再呼び出しは追加 STS コールにならない。
+	if _, rerr := creds.Retrieve(r.Context()); rerr != nil {
+		switch classifyFederatedError(rerr) {
+		case federatedErrForbidden:
+			slog.Warn("assumerole sts forbidden",
+				"error", rerr.Error(),
+				"account_id", accountID,
+				"role_name", roleName,
+			)
+			http.Error(w, "forbidden", http.StatusForbidden)
+		default:
+			slog.Warn("assumerole sts error",
+				"error", rerr.Error(),
+				"account_id", accountID,
+				"role_name", roleName,
+			)
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		}
+		return
+	}
+
+	roleARN := buildAssumeRoleARN(accountID, roleName)
+	sessionName := sanitizeSessionName("gw-ar-" + user.Subject)
+	slog.Info("assumerole request",
+		"account_id", accountID,
+		"role_name", roleName,
+		"role_arn", roleARN,
+		"session_name", sessionName,
+		"user_sub", user.Subject,
+		"user_email", user.Email,
+	)
+
+	r, ok := injectMetaAWSRegion(r, targetAWSRegion)
+	if !ok {
+		slog.Warn("assumerole injectMetaAWSRegion failed",
+			"account_id", accountID,
+			"role_name", roleName,
+		)
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	// makeFederatedRoundTripper と同パターンで STS クレデンシャルを注入した SigV4 Transport を組み立てる。
+	transport := &sigV4RoundTripper{
+		base:    sigV4HTTPTransport,
+		signer:  v4.NewSigner(),
+		region:  mcpRegion,
+		service: awsMCPService,
+		getCreds: func(ctx context.Context) (aws.Credentials, error) {
+			return creds.Retrieve(ctx)
+		},
+	}
+	buildProxy(target, transport).ServeHTTP(w, r)
 }
 
 // splitCSV splits a comma-separated string into a trimmed slice, returning nil for empty input.
