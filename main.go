@@ -839,10 +839,12 @@ func handleAssumeRoleRequest(
 	roleName := r.PathValue("role_name")
 
 	if !validateAccountID(accountID) {
+		slog.Warn("assumerole invalid account_id", "account_id", accountID)
 		http.Error(w, "invalid account_id", http.StatusBadRequest)
 		return
 	}
 	if !validateRoleName(roleName) {
+		slog.Warn("assumerole invalid role_name", "role_name", roleName)
 		http.Error(w, "invalid role_name", http.StatusBadRequest)
 		return
 	}
@@ -857,6 +859,10 @@ func handleAssumeRoleRequest(
 	}
 
 	if user == nil || user.Subject == "" {
+		slog.Error("assumerole missing user subject",
+			"account_id", accountID,
+			"role_name", roleName,
+		)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -907,6 +913,10 @@ func handleAssumeRoleRequest(
 
 	r, ok := injectMetaAWSRegion(r, targetAWSRegion)
 	if !ok {
+		slog.Warn("assumerole injectMetaAWSRegion failed",
+			"account_id", accountID,
+			"role_name", roleName,
+		)
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
