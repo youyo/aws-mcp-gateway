@@ -4,7 +4,7 @@
     "instanceName": "amg",
     "awsMcpRegion": "us-east-1",
     "targetAwsRegion": "ap-northeast-1",
-    "iamMode": "direct",
+    "iamMode": "shared",
     "assumeRoleArn": "",
     "federatedRoleArn": ""
   }

@@ -11,6 +11,11 @@ aws-mcp-gateway を AWS Lambda + Function URL で動かすための CDK (TypeScr
 | `AWS::Lambda::Function` | aws-mcp-gateway 本体 (arm64 / provided.al2023) |
 | `AWS::Lambda::Url` | Function URL (NONE auth, RESPONSE_STREAM) |
 
+> **Function URL の認証について**
+> OIDC 認証はアプリケーション層 (idproxy) で実施するため Function URL は `authType=NONE` が前提です。
+> `AWS_IAM` 認証は SigV4 署名を要求しブラウザ OIDC フローと両立しないため使えません。
+> DoS が懸念される場合は CloudFront + WAF や予約済み同時実行数で保護してください。
+
 ## 前提
 
 - AWS CDK v2 および Node.js 20+ がインストール済み
@@ -42,7 +47,7 @@ rm aws-mcp-gateway.tar.gz
     "instanceName": "amg",
     "awsMcpRegion": "us-east-1",
     "targetAwsRegion": "ap-northeast-1",
-    "iamMode": "direct",
+    "iamMode": "shared",
     "assumeRoleArn": "",
     "federatedRoleArn": ""
   }
@@ -54,9 +59,9 @@ rm aws-mcp-gateway.tar.gz
 | `instanceName` | 全リソース名のプレフィックス | `amg` |
 | `awsMcpRegion` | AWS MCP Server リージョン | `us-east-1` |
 | `targetAwsRegion` | AWS API コール先リージョン | `ap-northeast-1` |
-| `iamMode` | `direct` または `federated` | `direct` |
+| `iamMode` | `shared` または `federated` | `shared` |
 | `assumeRoleArn` | AssumeRole 先 ARN (省略可) | `""` |
-| `federatedRoleArn` | federated モード用 ARN (省略可) | `""` |
+| `federatedRoleArn` | federated モード用 ARN (federated 時は必須) | `""` |
 
 ### 3. SSM Parameter Store の設定
 
@@ -67,23 +72,23 @@ INSTANCE_NAME=amg
 REGION=ap-northeast-1
 
 # 初回は placeholder を設定 (Function URL 確定後に更新)
-aws ssm put-parameter --region $REGION --type SecureString \
+aws ssm put-parameter --region $REGION --type String \
   --name /${INSTANCE_NAME}/EXTERNAL_URL \
   --value "https://placeholder.invalid"
 
-aws ssm put-parameter --region $REGION --type SecureString \
+aws ssm put-parameter --region $REGION --type String \
   --name /${INSTANCE_NAME}/OIDC_ISSUER \
   --value "https://login.microsoftonline.com/<tenant-id>/v2.0"
 
-aws ssm put-parameter --region $REGION --type SecureString \
+aws ssm put-parameter --region $REGION --type String \
   --name /${INSTANCE_NAME}/OIDC_CLIENT_ID \
   --value "<your-client-id>"
 
-aws ssm put-parameter --region $REGION --type SecureString \
+aws ssm put-parameter --region $REGION --type String \
   --name /${INSTANCE_NAME}/OIDC_CLIENT_SECRET \
   --value "<your-client-secret>"
 
-aws ssm put-parameter --region $REGION --type SecureString \
+aws ssm put-parameter --region $REGION --type String \
   --name /${INSTANCE_NAME}/COOKIE_SECRET \
   --value "$(openssl rand -hex 32)"
 
@@ -94,12 +99,16 @@ aws ssm put-parameter --region $REGION --type String \
 aws ssm put-parameter --region $REGION --type String \
   --name /${INSTANCE_NAME}/DYNAMODB_REGION \
   --value "ap-northeast-1"
-
-# federated モードを使わない場合も空文字で作成が必要
-aws ssm put-parameter --region $REGION --type String \
-  --name /${INSTANCE_NAME}/FEDERATED_ROLE_ARN \
-  --value ""
 ```
+
+> `FEDERATED_ROLE_ARN` の SSM パラメータ作成は不要です。federated モードを利用する場合のみ
+> `cdk.json` の context または CLI の `-c federatedRoleArn=<ARN>` で引受先 Role ARN を渡してください
+> (例は後述の「コンテキスト値のオーバーライド」を参照)。
+
+> **シークレットの保存形式について**
+> `OIDC_CLIENT_SECRET` / `COOKIE_SECRET` はデプロイ時に Lambda 環境変数へ展開されるため `String` 型で保存します
+> (env 焼き込み時点で平文化は避けられません)。より高いセキュリティ要件がある場合は Secrets Manager の利用や
+> アプリ本体でのランタイム取得を検討してください。
 
 ---
 
@@ -121,7 +130,7 @@ aws ssm put-parameter \
   --region ap-northeast-1 \
   --name /${INSTANCE_NAME}/EXTERNAL_URL \
   --value "${FUNCTION_URL%/}" \
-  --type SecureString --overwrite
+  --type String --overwrite
 ```
 
 ### 2回目以降 — EXTERNAL_URL を反映して再デプロイ

@@ -6,7 +6,7 @@ const app = new cdk.App();
 const instanceName: string = app.node.tryGetContext('instanceName') ?? 'amg';
 const awsMcpRegion: string = app.node.tryGetContext('awsMcpRegion') ?? 'us-east-1';
 const targetAwsRegion: string = app.node.tryGetContext('targetAwsRegion') ?? 'ap-northeast-1';
-const iamMode: string = app.node.tryGetContext('iamMode') ?? 'direct';
+const iamMode: string = app.node.tryGetContext('iamMode') ?? 'shared';
 const assumeRoleArn: string = app.node.tryGetContext('assumeRoleArn') ?? '';
 const federatedRoleArn: string = app.node.tryGetContext('federatedRoleArn') ?? '';
 

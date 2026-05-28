@@ -30,6 +30,12 @@ export class AwsMcpGatewayStack extends cdk.Stack {
       federatedRoleArn,
     } = props;
 
+    // iamMode のバリデーション — main.go は "shared"/"federated" のみ有効
+    const VALID_IAM_MODES = ['shared', 'federated'];
+    if (!VALID_IAM_MODES.includes(iamMode)) {
+      throw new Error(`Invalid iamMode: "${iamMode}". Must be one of: ${VALID_IAM_MODES.join(', ')}`);
+    }
+
     // DynamoDB: セッションストア
     const sessionTable = new dynamodb.Table(this, 'SessionTable', {
       tableName: instanceName,
@@ -61,10 +67,14 @@ export class AwsMcpGatewayStack extends cdk.Stack {
     }
 
     if (iamMode === 'federated') {
+      // federated モードでは引受先 Role ARN が必須 (main.go の前提と同じ)
+      if (!federatedRoleArn) {
+        throw new Error('federatedRoleArn is required when iamMode is "federated"');
+      }
       lambdaRole.addToPolicy(new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
         actions: ['sts:AssumeRoleWithWebIdentity'],
-        resources: ['*'],
+        resources: [federatedRoleArn],
       }));
     }
 
@@ -78,18 +88,15 @@ export class AwsMcpGatewayStack extends cdk.Stack {
 
     // SSM パラメータ参照
     // デプロイ前に以下のパラメータを SSM Parameter Store に作成してください (README 参照)
+    // シークレットを含め全て String 型パラメータをデプロイ時に解決して env へ注入
+    // (CloudFormation の ssm-secure 動的参照は Lambda 環境変数では非対応のため String に統一)
     const externalUrl = ssm.StringParameter.valueForStringParameter(this, `/${instanceName}/EXTERNAL_URL`);
     const oidcIssuer = ssm.StringParameter.valueForStringParameter(this, `/${instanceName}/OIDC_ISSUER`);
     const oidcClientId = ssm.StringParameter.valueForStringParameter(this, `/${instanceName}/OIDC_CLIENT_ID`);
+    const oidcClientSecret = ssm.StringParameter.valueForStringParameter(this, `/${instanceName}/OIDC_CLIENT_SECRET`);
+    const cookieSecret = ssm.StringParameter.valueForStringParameter(this, `/${instanceName}/COOKIE_SECRET`);
     const dynamodbTable = ssm.StringParameter.valueForStringParameter(this, `/${instanceName}/DYNAMODB_TABLE`);
     const dynamodbRegion = ssm.StringParameter.valueForStringParameter(this, `/${instanceName}/DYNAMODB_REGION`);
-
-    // SecureString は CloudFormation dynamic reference で参照
-    const oidcClientSecret = `{{resolve:ssm-secure:/${instanceName}/OIDC_CLIENT_SECRET}}`;
-    const cookieSecret = `{{resolve:ssm-secure:/${instanceName}/COOKIE_SECRET}}`;
-    const federatedRoleArnSsm = federatedRoleArn
-      ? federatedRoleArn
-      : ssm.StringParameter.valueForStringParameter(this, `/${instanceName}/FEDERATED_ROLE_ARN`);
 
     // Lambda 関数
     // asset/ ディレクトリに bootstrap バイナリを配置してください (README 参照)
@@ -115,10 +122,11 @@ export class AwsMcpGatewayStack extends cdk.Stack {
         AWS_LWA_INVOKE_MODE: 'response_stream',
         ASSUME_ROLE_ARN: assumeRoleArn ?? '',
         IAM_MODE: iamMode,
-        FEDERATED_ROLE_ARN: federatedRoleArnSsm,
         STORE_BACKEND: 'dynamodb',
         DYNAMODB_TABLE: dynamodbTable,
         DYNAMODB_REGION: dynamodbRegion,
+        // FEDERATED_ROLE_ARN は federated モード時のみ設定 (main.go の必須要件と一致)
+        ...(iamMode === 'federated' ? { FEDERATED_ROLE_ARN: federatedRoleArn! } : {}),
       },
     });
 
