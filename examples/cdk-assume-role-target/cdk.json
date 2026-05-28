@@ -1,0 +1,10 @@
+{
+  "app": "npx ts-node --prefer-ts-exts bin/app.ts",
+  "context": {
+    "sourceAccountId": "111111111111",
+    "externalId": "my-external-id",
+    "roleName": "aws-mcp-gateway-target",
+    "organizationalUnitIds": ["ou-xxxx-yyyy"],
+    "regions": ["ap-northeast-1"]
+  }
+}
