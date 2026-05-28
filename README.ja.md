@@ -717,6 +717,13 @@ aws-mcp-gateway
 - クレデンシャルは `(account_id, role_name, user_subject)` の組み合わせごとにキャッシュされ、TTL は設定可能
 - OIDC ユーザーの `sub` が STS セッション名に埋め込まれ、CloudTrail での監査追跡が可能
 
+### IAM_MODE と ASSUME_ROLE_ARN との関係
+
+`/mcp/assumerole/` エンドポイントは `IAM_MODE` の設定に関わらず、**常にゲートウェイのランタイムクレデンシャル**（Lambda 実行ロール、ECS タスクロール、EC2 インスタンスプロファイル等）を使って `sts:AssumeRole` を呼び出します。
+
+- **`IAM_MODE=federated`**: 既存の `/mcp` エンドポイントはユーザーごとの OIDC ID Token を使って `AssumeRoleWithWebIdentity` を行いますが、`/mcp/assumerole/` エンドポイントは ID Token を使いません。ゲートウェイへのアクセス制御（OIDC 認証）は引き続き必須ですが、AWS 認証情報の分離は許可リストとランタイムロールの `sts:AssumeRole` 権限で行います。
+- **`ASSUME_ROLE_ARN`**: この変数は `/mcp` エンドポイントの中継ロール設定のみに影響します。`/mcp/assumerole/` エンドポイントは `ASSUME_ROLE_ARN` を無視し、ランタイムロールから対象ロールへ直接 AssumeRole します。
+
 ## アカウント分離
 
 AWS アカウントごとに 1 インスタンスをデプロイし、それぞれ専用の IAM ロールを割り当てます:

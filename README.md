@@ -665,6 +665,13 @@ Each target role needs a trust policy allowing the gateway's role:
 - Credentials are cached per `(account_id, role_name, user_subject)` with configurable TTL
 - The OIDC user's `sub` is embedded in the STS session name for CloudTrail auditability
 
+### Interaction with IAM_MODE and ASSUME_ROLE_ARN
+
+The `/mcp/assumerole/` endpoint **always uses the gateway's runtime credentials** (Lambda execution role, ECS task role, EC2 instance profile, etc.) to call `sts:AssumeRole`, regardless of `IAM_MODE`.
+
+- **`IAM_MODE=federated`**: The existing `/mcp` endpoint uses per-user OIDC ID Tokens for `AssumeRoleWithWebIdentity`. The `/mcp/assumerole/` endpoint does **not** use the ID Token — it calls `AssumeRole` from the runtime role. OIDC authentication (gateway login) is still required, but AWS credential isolation is handled by the allowlist and the runtime role's `sts:AssumeRole` permissions, not by per-user OIDC credentials.
+- **`ASSUME_ROLE_ARN`**: This variable configures an intermediate role for the `/mcp` endpoint only. The `/mcp/assumerole/` endpoint ignores `ASSUME_ROLE_ARN` and assumes the target role directly from the runtime role.
+
 ## Per-Account Isolation
 
 Deploy one instance per AWS account, each with its own IAM role:

@@ -812,11 +812,19 @@ func TestValidateRoleName(t *testing.T) {
 			t.Errorf("validateRoleName(%q) = false, want true", s)
 		}
 	}
-	invalid := []string{"../evil", "..", "role;drop", "", "\x00", "ロール名"}
+	invalid := []string{"../evil", "..", "role;drop", "", "\x00", "ロール名",
+		// IAM ロール名の最大長 64 文字を超えるケース
+		"A" + strings.Repeat("a", 64),
+	}
 	for _, s := range invalid {
 		if validateRoleName(s) {
 			t.Errorf("validateRoleName(%q) = true, want false", s)
 		}
+	}
+	// 64 文字ちょうどは有効
+	maxLen := strings.Repeat("a", 64)
+	if !validateRoleName(maxLen) {
+		t.Errorf("validateRoleName(%q) = false, want true (64 chars)", maxLen)
 	}
 }
 

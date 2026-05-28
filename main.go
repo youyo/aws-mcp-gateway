@@ -639,7 +639,13 @@ func main() {
 	}
 
 	// STS クライアントを assumerole エンドポイント用に生成する。
-	// ASSUME_ROLE_ARN を経由せずランタイムロールを直接使う（per-user AssumeRole が目的）。
+	// 設計上の決定:
+	//   - IAM_MODE (shared/federated) に関わらず、ランタイムロール（実行環境の credentials）から
+	//     直接 AssumeRole する。federated モードの per-user OIDC 認証情報は使わない。
+	//   - ASSUME_ROLE_ARN も使わない。assumerole エンドポイントはパスで指定した
+	//     account_id/role_name への AssumeRole が目的であり、中継ロールは不要。
+	//   - OIDC 認証（auth.Wrap）は必須。ゲートウェイへのアクセス制御は idproxy が担保する。
+	//     AWS 権限分離はランタイムロールの sts:AssumeRole 権限と allowlist で行う。
 	assumeRoleCfg := loadAssumeRoleConfig()
 	stsBaseCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(mcpRegion))
 	if err != nil {
@@ -738,15 +744,18 @@ func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRole
 		if time.Since(entry.createdAt) < maxTTL {
 			return entry.creds, nil
 		}
-		assumeRoleCredsCache.Delete(cacheKey)
+		// CompareAndDelete で TOCTOU を防ぐ: 自分が読んだエントリと同一の場合のみ削除。
+		assumeRoleCredsCache.CompareAndDelete(cacheKey, cached)
 	}
 
 	roleARN := buildAssumeRoleARN(accountID, roleName)
 	sessionName := sanitizeSessionName("gw-ar-" + sub)
 
+	// STS セッション期間はデフォルト（1 時間）を使用する。
+	// maxTTL はローカルキャッシュの退避 TTL であり STS セッション期間とは独立。
+	// o.Duration を maxTTL に設定すると STS 最小 Duration（900 秒）を下回る可能性がある。
 	provider := stscreds.NewAssumeRoleProvider(stsClient, roleARN, func(o *stscreds.AssumeRoleOptions) {
 		o.RoleSessionName = sessionName
-		o.Duration = maxTTL
 	})
 
 	// エビクションロジックを組み込んだ provider でラップした CredentialsCache をキャッシュする。
@@ -762,7 +771,10 @@ func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRole
 	})
 
 	newEntry := &assumeRoleCacheEntry{
-		creds:     aws.NewCredentialsCache(evictingProvider),
+		// ExpiryWindow: STS トークン有効期限の 5 分前に自動更新を試みる。
+		creds: aws.NewCredentialsCache(evictingProvider, func(o *aws.CredentialsCacheOptions) {
+			o.ExpiryWindow = 5 * time.Minute
+		}),
 		createdAt: time.Now(),
 	}
 	actual, _ := assumeRoleCredsCache.LoadOrStore(cacheKey, newEntry)
@@ -783,6 +795,10 @@ var (
 
 func validateAccountID(s string) bool { return reAccountID.MatchString(s) }
 func validateRoleName(s string) bool {
+	// IAM ロール名の最大長は 64 文字。
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
 	if strings.Contains(s, "..") {
 		return false
 	}
