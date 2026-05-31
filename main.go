@@ -635,7 +635,7 @@ func main() {
 	// IAM_MODE determines how AWS credentials are resolved per request.
 	// "shared" (default): use the runtime role (Lambda/ECS/EC2) or ASSUME_ROLE_ARN.
 	// "federated": use the OIDC ID Token to AssumeRoleWithWebIdentity per authenticated user.
-	iamMode := getEnvOrDefault("IAM_MODE", "shared")
+	iamMode := strings.ToLower(strings.TrimSpace(getEnvOrDefault("IAM_MODE", "shared")))
 	federatedRoleARN := os.Getenv("FEDERATED_ROLE_ARN")
 	if iamMode == "federated" && federatedRoleARN == "" {
 		slog.Error("FEDERATED_ROLE_ARN is required when IAM_MODE=federated")
