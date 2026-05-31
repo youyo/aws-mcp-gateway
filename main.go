@@ -185,7 +185,7 @@ var newChainedSTSClient = func(ctx context.Context, region string, creds aws.Cre
 
 // getFederatedCreds は (sub, idToken, assumeRoleARN) をキーに CredentialsCache をキャッシュし、
 // per-user の CredentialsCache と cacheKey を返す。
-// getFederatedRoundTripper および getFederatedCredsForAssumeRole から共通で利用する。
+// getFederatedRoundTripper および handleAssumeRoleRequest から共通で利用する。
 //
 // assumeRoleARN が空でない場合はロールチェーンを構成する:
 //
@@ -637,6 +637,10 @@ func main() {
 	// "federated": use the OIDC ID Token to AssumeRoleWithWebIdentity per authenticated user.
 	iamMode := strings.ToLower(strings.TrimSpace(getEnvOrDefault("IAM_MODE", "shared")))
 	federatedRoleARN := os.Getenv("FEDERATED_ROLE_ARN")
+	if iamMode != "shared" && iamMode != "federated" {
+		slog.Error("invalid IAM_MODE: must be 'shared' or 'federated'", "value", iamMode)
+		os.Exit(1)
+	}
 	if iamMode == "federated" && federatedRoleARN == "" {
 		slog.Error("FEDERATED_ROLE_ARN is required when IAM_MODE=federated")
 		os.Exit(1)
@@ -995,7 +999,7 @@ func handleAssumeRoleRequest(
 
 		// getFederatedCreds で WebIdentity 認証済み CredentialsCache を取得する。
 		// assumeRoleARN="" を渡して WebIdentity のみのチェーンにする（assumerole 自身が AssumeRole する）。
-		federatedCreds, _, ferr := getFederatedCreds(r.Context(), mcpRegion, federatedRoleARN, user.IDToken, user.Subject, "")
+		federatedCreds, federatedCacheKey, ferr := getFederatedCreds(r.Context(), mcpRegion, federatedRoleARN, user.IDToken, user.Subject, "")
 		if ferr != nil {
 			slog.Error("assumerole: failed to get federated credentials",
 				"error", ferr.Error(),
@@ -1016,6 +1020,7 @@ func handleAssumeRoleRequest(
 				w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="OIDC ID Token expired or invalid"`)
 				http.Error(w, "invalid_token", http.StatusUnauthorized)
 			case federatedErrForbidden:
+				evictFederatedEntry(federatedCacheKey)
 				slog.Warn("assumerole federated STS denied access",
 					"error", ferr.Error(), "account_id", accountID, "role_name", roleName)
 				http.Error(w, "forbidden", http.StatusForbidden)
@@ -1029,6 +1034,11 @@ func handleAssumeRoleRequest(
 
 		// federated CredentialsCache から AssumeRole 用の STS クライアントを生成する。
 		// baseCfg を値コピーし Credentials のみ差し替えるため FIPS・Retryer 等の設定が継承される。
+		// TODO(quality): getAssumeRoleCredentials のキャッシュにヒットした場合、
+		// この newChainedSTSClient 呼び出しは不要になる。
+		// getAssumeRoleCredentials に lazy factory パターン（stsClient を func で受け取る）を
+		// 適用すればキャッシュヒット時スキップが可能だが、e2e_test.go 内の直接呼び出し箇所
+		// （8 箇所）のシグネチャ変更が必要となり影響範囲が大きいため現時点では見送る。
 		chainSTS, cerr := newChainedSTSClient(r.Context(), mcpRegion, federatedCreds)
 		if cerr != nil {
 			slog.Error("assumerole: failed to create chained STS client",
@@ -1083,6 +1093,7 @@ func handleAssumeRoleRequest(
 		"session_name", sessionName,
 		"user_sub", user.Subject,
 		"user_email", user.Email,
+		"iam_mode", iamMode,
 	)
 
 	r, ok := injectMetaAWSRegion(r, targetAWSRegion)

@@ -1593,6 +1593,73 @@ func TestHandleAssumeRoleRequest_Federated_Success(t *testing.T) {
 	t.Logf("✓ federated 正常系: status=%d Authorization=%s...", rec.Code, capturedAuth[:min(50, len(capturedAuth))])
 }
 
+// TestHandleAssumeRoleRequest_Federated_AccessDenied は
+// iamMode=federated で WebIdentity が AccessDenied エラーを返した場合に
+// 403 を返し、federatedCredsCache からエントリが evict されることを確認する。
+func TestHandleAssumeRoleRequest_Federated_AccessDenied(t *testing.T) {
+	federatedCredsCache = sync.Map{}
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() {
+		federatedCredsCache = sync.Map{}
+		assumeRoleCredsCache = sync.Map{}
+	})
+
+	target, _ := url.Parse("http://upstream.example.invalid/mcp")
+	cfg := assumeRoleConfig{
+		allowedAccounts:  []string{"123456789012"},
+		allowedRoleNames: []string{"AwsMcpGatewayRole"},
+		maxCacheTTL:      1 * time.Hour,
+	}
+
+	// WebIdentity 層で AccessDenied エラーを返すようにモックする。
+	// handleAssumeRoleRequest 内の getFederatedCreds → federatedCreds.Retrieve() で
+	// このエラーが発生し、403 を返すことを確認する。
+	accessDeniedErr := &stubAPIError{code: "AccessDenied", msg: "access denied"}
+	mockSTS := &mockFederatedSTS{webIdentityErr: accessDeniedErr}
+
+	origNewWebIdentitySTSClient := newWebIdentitySTSClient
+	origNewChainedSTSClient := newChainedSTSClient
+	t.Cleanup(func() {
+		newWebIdentitySTSClient = origNewWebIdentitySTSClient
+		newChainedSTSClient = origNewChainedSTSClient
+	})
+	newWebIdentitySTSClient = func(ctx context.Context, region string) (stscreds.AssumeRoleWithWebIdentityAPIClient, error) {
+		return mockSTS, nil
+	}
+	newChainedSTSClient = func(ctx context.Context, region string, creds aws.CredentialsProvider) (stscreds.AssumeRoleAPIClient, error) {
+		return mockSTS, nil
+	}
+
+	user := &idproxy.User{
+		Email:   "alice@example.com",
+		Subject: "sub-alice",
+		IDToken: "eyJhbGciOiJSUzI1NiJ9.access-denied-token",
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/mcp/assumerole/accounts/123456789012/rolename/AwsMcpGatewayRole", strings.NewReader(`{}`))
+	req.SetPathValue("account_id", "123456789012")
+	req.SetPathValue("role_name", "AwsMcpGatewayRole")
+
+	handleAssumeRoleRequest(rec, req, user, cfg, target, nil, "us-east-1", "ap-northeast-1", "federated", "arn:aws:iam::123456789012:role/FederatedRole")
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("期待値 403、実際: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// eviction 確認: federatedCredsCache にエントリが残っていないこと。
+	var remaining int
+	federatedCredsCache.Range(func(_, _ interface{}) bool {
+		remaining++
+		return true
+	})
+	if remaining != 0 {
+		t.Errorf("federatedCredsCache にエントリが残存している（evict されていない）: %d 件", remaining)
+	}
+
+	t.Logf("✓ federated AccessDenied 時に 403 を返し、キャッシュが evict された: status=%d", rec.Code)
+}
+
 // TestGetFederatedCreds_CacheHit は getFederatedCreds の同一 sub+fingerprint でキャッシュヒットすることを確認する。
 func TestGetFederatedCreds_CacheHit(t *testing.T) {
 	federatedCredsCache = sync.Map{}
