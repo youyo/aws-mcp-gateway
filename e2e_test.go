@@ -878,6 +878,63 @@ func TestLoadAssumeRoleConfig(t *testing.T) {
 			t.Errorf("maxCacheTTL = %v, want %v", cfg.maxCacheTTL, minAssumeRoleMaxCacheTTL)
 		}
 	})
+	t.Run("ASSUMEROLE_EXTERNAL_ID 未設定時は空文字", func(t *testing.T) {
+		t.Setenv("ASSUMEROLE_EXTERNAL_ID", "")
+		cfg := loadAssumeRoleConfig()
+		if cfg.externalID != "" {
+			t.Errorf("externalID = %q, want 空文字", cfg.externalID)
+		}
+	})
+	t.Run("ASSUMEROLE_EXTERNAL_ID 設定時はその値（前後空白を除去）", func(t *testing.T) {
+		t.Setenv("ASSUMEROLE_EXTERNAL_ID", "  ext-123  ")
+		cfg := loadAssumeRoleConfig()
+		if cfg.externalID != "ext-123" {
+			t.Errorf("externalID = %q, want %q", cfg.externalID, "ext-123")
+		}
+	})
+}
+
+// ExternalId サポート: getAssumeRoleCredentials が externalID を AssumeRole に伝播することを確認する。
+func TestGetAssumeRoleCredentials_ExternalId(t *testing.T) {
+	t.Run("externalID 指定時は ExternalId として AssumeRole に伝播する", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		client := &mockAssumeRoleClient{}
+		creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", "sub-extid", "my-external-id", 1*time.Hour)
+		if err != nil {
+			t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
+		}
+		if _, rerr := creds.Retrieve(context.Background()); rerr != nil {
+			t.Fatalf("Retrieve エラー: %v", rerr)
+		}
+		got := client.externalId()
+		if got == nil {
+			t.Fatal("ExternalId が AssumeRole に渡っていない（nil）")
+		}
+		if *got != "my-external-id" {
+			t.Errorf("ExternalId = %q, want %q", *got, "my-external-id")
+		}
+		t.Logf("✓ ExternalId = %q が伝播された", *got)
+	})
+
+	t.Run("externalID 空時は ExternalId を設定しない（後方互換）", func(t *testing.T) {
+		assumeRoleCredsCache = sync.Map{}
+		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+		client := &mockAssumeRoleClient{}
+		creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", "sub-noextid", "", 1*time.Hour)
+		if err != nil {
+			t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
+		}
+		if _, rerr := creds.Retrieve(context.Background()); rerr != nil {
+			t.Fatalf("Retrieve エラー: %v", rerr)
+		}
+		if got := client.externalId(); got != nil {
+			t.Errorf("ExternalId = %q, want nil（未設定であるべき）", *got)
+		}
+		t.Logf("✓ ExternalId 未設定（後方互換）")
+	})
 }
 
 // M3: isAllowedAssumeRole のテスト
@@ -905,10 +962,16 @@ func TestIsAllowed(t *testing.T) {
 type mockAssumeRoleClient struct {
 	callCount int64
 	err       error
+	// 直近の AssumeRole 呼び出しで渡された ExternalId をキャプチャする（ExternalId 伝播テスト用）。
+	mu                 sync.Mutex
+	capturedExternalId *string
 }
 
 func (m *mockAssumeRoleClient) AssumeRole(ctx context.Context, params *sts.AssumeRoleInput, optFns ...func(*sts.Options)) (*sts.AssumeRoleOutput, error) {
 	atomic.AddInt64(&m.callCount, 1)
+	m.mu.Lock()
+	m.capturedExternalId = params.ExternalId
+	m.mu.Unlock()
 	if m.err != nil {
 		return nil, m.err
 	}
@@ -921,6 +984,13 @@ func (m *mockAssumeRoleClient) AssumeRole(ctx context.Context, params *sts.Assum
 			Expiration:      &expiry,
 		},
 	}, nil
+}
+
+// externalId は直近の AssumeRole 呼び出しでキャプチャした ExternalId を返す。
+func (m *mockAssumeRoleClient) externalId() *string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.capturedExternalId
 }
 
 // M4: TestBuildAssumeRoleARN は buildAssumeRoleARN が正しい ARN 文字列を返すことを確認する。
@@ -941,7 +1011,7 @@ func TestGetAssumeRoleCredentials_SessionName(t *testing.T) {
 
 	longSub := strings.Repeat("a", 100)
 	client := &mockAssumeRoleClient{}
-	creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", longSub, 1*time.Hour)
+	creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", longSub, "", 1*time.Hour)
 	if err != nil {
 		t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
 	}
@@ -972,11 +1042,11 @@ func TestGetAssumeRoleCredentials_CacheHit(t *testing.T) {
 	client := &mockAssumeRoleClient{}
 	ctx := context.Background()
 
-	creds1, err1 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", 1*time.Hour)
+	creds1, err1 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", "", 1*time.Hour)
 	if err1 != nil {
 		t.Fatalf("1回目 getAssumeRoleCredentials エラー: %v", err1)
 	}
-	creds2, err2 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", 1*time.Hour)
+	creds2, err2 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", "", 1*time.Hour)
 	if err2 != nil {
 		t.Fatalf("2回目 getAssumeRoleCredentials エラー: %v", err2)
 	}
@@ -998,7 +1068,7 @@ func TestGetAssumeRoleCredentials_AccessDenied(t *testing.T) {
 	client := &mockAssumeRoleClient{err: accessDeniedErr}
 	ctx := context.Background()
 
-	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-denied", 1*time.Hour)
+	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-denied", "", 1*time.Hour)
 	if err != nil {
 		t.Fatalf("getAssumeRoleCredentials は AccessDenied をラップして返すはずだが直接エラー: %v", err)
 	}
@@ -1030,7 +1100,7 @@ func TestGetAssumeRoleCredentials_Throttling(t *testing.T) {
 	client := &mockAssumeRoleClient{err: throttleErr}
 	ctx := context.Background()
 
-	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-throttle", 1*time.Hour)
+	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-throttle", "", 1*time.Hour)
 	if err != nil {
 		t.Fatalf("getAssumeRoleCredentials は Throttling をラップして返すはずだが直接エラー: %v", err)
 	}

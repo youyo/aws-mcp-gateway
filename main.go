@@ -736,7 +736,7 @@ func buildAssumeRoleARN(accountID, roleName string) string {
 // maxCacheTTL 経過後はエントリを削除して再作成する（メモリリーク防止）。
 // AccessDenied 時はキャッシュエントリを削除してエラーを返す。
 // Throttling 等の transient エラー時はキャッシュを保持してエラーを返す。
-func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRoleAPIClient, accountID, roleName, sub string, maxTTL time.Duration) (*aws.CredentialsCache, error) {
+func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRoleAPIClient, accountID, roleName, sub, externalID string, maxTTL time.Duration) (*aws.CredentialsCache, error) {
 	cacheKey := accountID + "::" + roleName + "::" + sub
 
 	if cached, ok := assumeRoleCredsCache.Load(cacheKey); ok {
@@ -756,6 +756,11 @@ func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRole
 	// o.Duration を maxTTL に設定すると STS 最小 Duration（900 秒）を下回る可能性がある。
 	provider := stscreds.NewAssumeRoleProvider(stsClient, roleARN, func(o *stscreds.AssumeRoleOptions) {
 		o.RoleSessionName = sessionName
+		// ExternalId は配布先 target role の信頼ポリシー条件（Confused Deputy 攻撃対策）。
+		// 空の場合は設定しない（ExternalId 条件を持たない既存ロールとの後方互換のため）。
+		if externalID != "" {
+			o.ExternalID = aws.String(externalID)
+		}
 	})
 
 	// エビクションロジックを組み込んだ provider でラップした CredentialsCache をキャッシュする。
@@ -808,7 +813,10 @@ func validateRoleName(s string) bool {
 type assumeRoleConfig struct {
 	allowedAccounts  []string
 	allowedRoleNames []string
-	maxCacheTTL      time.Duration
+	// externalID は配布先 target role の信頼ポリシーに設定された sts:ExternalId 条件値。
+	// Confused Deputy 攻撃対策。空の場合は AssumeRole 時に ExternalId を付与しない。
+	externalID  string
+	maxCacheTTL time.Duration
 }
 
 const (
@@ -820,6 +828,7 @@ func loadAssumeRoleConfig() assumeRoleConfig {
 	cfg := assumeRoleConfig{
 		allowedAccounts:  splitCSV(os.Getenv("ASSUMEROLE_ALLOWED_ACCOUNTS")),
 		allowedRoleNames: splitCSV(os.Getenv("ASSUMEROLE_ALLOWED_ROLE_NAMES")),
+		externalID:       strings.TrimSpace(os.Getenv("ASSUMEROLE_EXTERNAL_ID")),
 		maxCacheTTL:      defaultAssumeRoleMaxCacheTTL,
 	}
 	if raw := os.Getenv("ASSUMEROLE_MAX_CACHE_TTL"); raw != "" {
@@ -834,6 +843,11 @@ func loadAssumeRoleConfig() assumeRoleConfig {
 	}
 	if len(cfg.allowedAccounts) == 0 || len(cfg.allowedRoleNames) == 0 {
 		slog.Warn("ASSUMEROLE_ALLOWED_ACCOUNTS or ASSUMEROLE_ALLOWED_ROLE_NAMES is not set; all /mcp/assumerole/ requests will be denied")
+	} else if cfg.externalID == "" {
+		// assumerole が有効（allowlist 設定済み）なのに ExternalId 未設定の場合、
+		// 配布先 target role が ExternalId 条件を持つと全 AssumeRole が AccessDenied になる。
+		// 逆に条件を持たない場合は Confused Deputy 対策が効いていないため、運用ミス検知として警告する。
+		slog.Warn("ASSUMEROLE_EXTERNAL_ID is not set; AssumeRole requests will proceed without an ExternalId (Confused Deputy protection may be absent)")
 	}
 	return cfg
 }
@@ -905,7 +919,7 @@ func handleAssumeRoleRequest(
 		return
 	}
 
-	creds, err := getAssumeRoleCredentials(r.Context(), stsClient, accountID, roleName, user.Subject, cfg.maxCacheTTL)
+	creds, err := getAssumeRoleCredentials(r.Context(), stsClient, accountID, roleName, user.Subject, cfg.externalID, cfg.maxCacheTTL)
 	if err != nil {
 		slog.Error("getAssumeRoleCredentials failed",
 			"error", err.Error(),
