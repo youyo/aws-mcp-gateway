@@ -1428,28 +1428,6 @@ func (m *mockFederatedSTS) AssumeRole(ctx context.Context, params *sts.AssumeRol
 	}, nil
 }
 
-// mockWebIdentitySTSClient は AssumeRoleWithWebIdentity / AssumeRole を実装するテスト用モック。
-// TestHandleAssumeRoleRequest_Federated_* テストで newChainedSTSClient 注入に使用する。
-// Deprecated: mockFederatedSTS を使用すること。後方互換のために残す。
-type mockWebIdentitySTSClient struct {
-	err error
-}
-
-func (m *mockWebIdentitySTSClient) AssumeRole(ctx context.Context, params *sts.AssumeRoleInput, optFns ...func(*sts.Options)) (*sts.AssumeRoleOutput, error) {
-	if m.err != nil {
-		return nil, m.err
-	}
-	expiry := time.Now().Add(1 * time.Hour)
-	return &sts.AssumeRoleOutput{
-		Credentials: &ststypes.Credentials{
-			AccessKeyId:     aws.String("AKIA_FEDERATED"),
-			SecretAccessKey: aws.String("secret_federated"),
-			SessionToken:    aws.String("token_federated"),
-			Expiration:      &expiry,
-		},
-	}, nil
-}
-
 // TestHandleAssumeRoleRequest_Federated_IDTokenMissing は
 // iamMode=federated で user.IDToken="" の場合に 500 を返すことを確認する（fail-closed）。
 func TestHandleAssumeRoleRequest_Federated_IDTokenMissing(t *testing.T) {
