@@ -841,30 +841,42 @@ func loadAssumeRoleConfig() assumeRoleConfig {
 			cfg.maxCacheTTL = d
 		}
 	}
-	if len(cfg.allowedAccounts) == 0 || len(cfg.allowedRoleNames) == 0 {
-		slog.Warn("ASSUMEROLE_ALLOWED_ACCOUNTS or ASSUMEROLE_ALLOWED_ROLE_NAMES is not set; all /mcp/assumerole/ requests will be denied")
+	// role 名 allowlist が主制御。空なら全 assumerole リクエストが拒否される。
+	if len(cfg.allowedRoleNames) == 0 {
+		slog.Warn("ASSUMEROLE_ALLOWED_ROLE_NAMES is not set; all /mcp/assumerole/ requests will be denied")
 	} else if cfg.externalID == "" {
-		// assumerole が有効（allowlist 設定済み）なのに ExternalId 未設定の場合、
+		// assumerole が有効（role allowlist 設定済み）なのに ExternalId 未設定の場合、
 		// 配布先 target role が ExternalId 条件を持つと全 AssumeRole が AccessDenied になる。
 		// 逆に条件を持たない場合は Confused Deputy 対策が効いていないため、運用ミス検知として警告する。
 		slog.Warn("ASSUMEROLE_EXTERNAL_ID is not set; AssumeRole requests will proceed without an ExternalId (Confused Deputy protection may be absent)")
+	}
+	// account allowlist 未設定 = 任意アカウント許可。開放姿勢を起動時に可視化する。
+	if len(cfg.allowedRoleNames) > 0 && len(cfg.allowedAccounts) == 0 {
+		slog.Warn("ASSUMEROLE_ALLOWED_ACCOUNTS is not set; AssumeRole permitted for any account with an allowed role name")
 	}
 	return cfg
 }
 
 func isAllowedAssumeRole(cfg assumeRoleConfig, accountID, roleName string) bool {
-	if len(cfg.allowedAccounts) == 0 || len(cfg.allowedRoleNames) == 0 {
+	// role 名 allowlist は必須の主制御。空なら全拒否（fail-closed）。
+	if len(cfg.allowedRoleNames) == 0 {
 		return false
 	}
-	accountOK := false
-	for _, a := range cfg.allowedAccounts {
-		if a == accountID {
-			accountOK = true
-			break
+	// account allowlist は任意。空の場合は任意アカウントを許可する
+	// （対象アカウントが多数の場合にリスト維持を不要にするため）。
+	// 設定されている場合のみアカウントを制限する。
+	// この場合の認可境界は role 名 allowlist + ExternalId + target role の信頼ポリシー。
+	if len(cfg.allowedAccounts) > 0 {
+		accountOK := false
+		for _, a := range cfg.allowedAccounts {
+			if a == accountID {
+				accountOK = true
+				break
+			}
 		}
-	}
-	if !accountOK {
-		return false
+		if !accountOK {
+			return false
+		}
 	}
 	for _, r := range cfg.allowedRoleNames {
 		if r == roleName {

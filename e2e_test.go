@@ -952,6 +952,27 @@ func TestIsAllowed(t *testing.T) {
 	if isAllowedAssumeRole(cfg, "123456789012", "OtherRole") {
 		t.Error("role が許可リスト外の場合は false を期待")
 	}
+	// account allowlist 未設定 = 任意アカウント許可（role 名のみで制御）。
+	roleOnly := assumeRoleConfig{
+		allowedRoleNames: []string{"aws-mcp-gateway-target"},
+	}
+	if !isAllowedAssumeRole(roleOnly, "999999999999", "aws-mcp-gateway-target") {
+		t.Error("account allowlist 未設定時は任意アカウント + 許可 role で true を期待")
+	}
+	if !isAllowedAssumeRole(roleOnly, "111111111111", "aws-mcp-gateway-target") {
+		t.Error("account allowlist 未設定時は別の任意アカウントでも true を期待")
+	}
+	if isAllowedAssumeRole(roleOnly, "999999999999", "OtherRole") {
+		t.Error("account allowlist 未設定でも role 名が許可リスト外なら false を期待")
+	}
+	// role allowlist 未設定は account の有無に関わらず全拒否（fail-closed）。
+	accountOnly := assumeRoleConfig{
+		allowedAccounts: []string{"123456789012"},
+	}
+	if isAllowedAssumeRole(accountOnly, "123456789012", "aws-mcp-gateway-target") {
+		t.Error("role allowlist 未設定時は全拒否（fail-closed）を期待")
+	}
+
 	empty := assumeRoleConfig{}
 	if isAllowedAssumeRole(empty, "123456789012", "AwsMcpGatewayRole") {
 		t.Error("空の cfg の場合は false を期待")
