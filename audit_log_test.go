@@ -129,7 +129,7 @@ func TestAuditLog_SuccessRequest(t *testing.T) {
 	req.SetPathValue("account_id", "123456789012")
 	req.SetPathValue("role_name", "AwsMcpGatewayRole")
 
-	handleAssumeRoleRequest(rec, req, user, cfg, target, stsClient, "us-east-1", "ap-northeast-1")
+	handleAssumeRoleRequest(rec, req, user, cfg, target, stsClient, "us-east-1", "ap-northeast-1", "shared", "")
 
 	if rec.Code != 200 {
 		t.Fatalf("期待値 200、実際: %d body=%s", rec.Code, rec.Body.String())
@@ -176,7 +176,7 @@ func TestAuditLog_ForbiddenByAllowlist(t *testing.T) {
 	req.SetPathValue("account_id", "999999999999")
 	req.SetPathValue("role_name", "AwsMcpGatewayRole")
 
-	handleAssumeRoleRequest(rec, req, user, cfg, target, stsClient, "us-east-1", "ap-northeast-1")
+	handleAssumeRoleRequest(rec, req, user, cfg, target, stsClient, "us-east-1", "ap-northeast-1", "shared", "")
 
 	if rec.Code != 403 {
 		t.Fatalf("期待値 403、実際: %d", rec.Code)
@@ -215,7 +215,7 @@ func TestAuditLog_STSAccessDenied(t *testing.T) {
 	req.SetPathValue("account_id", "123456789012")
 	req.SetPathValue("role_name", "AwsMcpGatewayRole")
 
-	handleAssumeRoleRequest(rec, req, user, cfg, target, stsClient, "us-east-1", "ap-northeast-1")
+	handleAssumeRoleRequest(rec, req, user, cfg, target, stsClient, "us-east-1", "ap-northeast-1", "shared", "")
 
 	if rec.Code != 403 {
 		t.Fatalf("期待値 403、実際: %d", rec.Code)
@@ -254,7 +254,7 @@ func TestAuditLog_STSThrottling(t *testing.T) {
 	req.SetPathValue("account_id", "123456789012")
 	req.SetPathValue("role_name", "AwsMcpGatewayRole")
 
-	handleAssumeRoleRequest(rec, req, user, cfg, target, stsClient, "us-east-1", "ap-northeast-1")
+	handleAssumeRoleRequest(rec, req, user, cfg, target, stsClient, "us-east-1", "ap-northeast-1", "shared", "")
 
 	if rec.Code != 503 {
 		t.Fatalf("期待値 503、実際: %d", rec.Code)

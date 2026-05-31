@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	ststypes "github.com/aws/aws-sdk-go-v2/service/sts/types"
 	"github.com/aws/smithy-go"
@@ -901,7 +902,7 @@ func TestGetAssumeRoleCredentials_ExternalId(t *testing.T) {
 		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
 
 		client := &mockAssumeRoleClient{}
-		creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", "sub-extid", "my-external-id", 1*time.Hour)
+		creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", "sub-extid", "my-external-id", 1*time.Hour, "")
 		if err != nil {
 			t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
 		}
@@ -923,7 +924,7 @@ func TestGetAssumeRoleCredentials_ExternalId(t *testing.T) {
 		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
 
 		client := &mockAssumeRoleClient{}
-		creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", "sub-noextid", "", 1*time.Hour)
+		creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", "sub-noextid", "", 1*time.Hour, "")
 		if err != nil {
 			t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
 		}
@@ -1032,7 +1033,7 @@ func TestGetAssumeRoleCredentials_SessionName(t *testing.T) {
 
 	longSub := strings.Repeat("a", 100)
 	client := &mockAssumeRoleClient{}
-	creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", longSub, "", 1*time.Hour)
+	creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", longSub, "", 1*time.Hour, "")
 	if err != nil {
 		t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
 	}
@@ -1063,11 +1064,11 @@ func TestGetAssumeRoleCredentials_CacheHit(t *testing.T) {
 	client := &mockAssumeRoleClient{}
 	ctx := context.Background()
 
-	creds1, err1 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", "", 1*time.Hour)
+	creds1, err1 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", "", 1*time.Hour, "")
 	if err1 != nil {
 		t.Fatalf("1回目 getAssumeRoleCredentials エラー: %v", err1)
 	}
-	creds2, err2 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", "", 1*time.Hour)
+	creds2, err2 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", "", 1*time.Hour, "")
 	if err2 != nil {
 		t.Fatalf("2回目 getAssumeRoleCredentials エラー: %v", err2)
 	}
@@ -1089,7 +1090,7 @@ func TestGetAssumeRoleCredentials_AccessDenied(t *testing.T) {
 	client := &mockAssumeRoleClient{err: accessDeniedErr}
 	ctx := context.Background()
 
-	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-denied", "", 1*time.Hour)
+	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-denied", "", 1*time.Hour, "")
 	if err != nil {
 		t.Fatalf("getAssumeRoleCredentials は AccessDenied をラップして返すはずだが直接エラー: %v", err)
 	}
@@ -1121,7 +1122,7 @@ func TestGetAssumeRoleCredentials_Throttling(t *testing.T) {
 	client := &mockAssumeRoleClient{err: throttleErr}
 	ctx := context.Background()
 
-	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-throttle", "", 1*time.Hour)
+	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-throttle", "", 1*time.Hour, "")
 	if err != nil {
 		t.Fatalf("getAssumeRoleCredentials は Throttling をラップして返すはずだが直接エラー: %v", err)
 	}
@@ -1206,7 +1207,7 @@ func TestHandleAssumeRoleRequest(t *testing.T) {
 		req.SetPathValue("account_id", allowedAccount)
 		req.SetPathValue("role_name", allowedRole)
 
-		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion, "shared", "")
 
 		if rec.Code != http.StatusOK {
 			t.Errorf("期待値 200、実際: %d body=%s", rec.Code, rec.Body.String())
@@ -1227,7 +1228,7 @@ func TestHandleAssumeRoleRequest(t *testing.T) {
 		req.SetPathValue("account_id", "bad-account")
 		req.SetPathValue("role_name", allowedRole)
 
-		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion, "shared", "")
 
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("期待値 400、実際: %d", rec.Code)
@@ -1249,7 +1250,7 @@ func TestHandleAssumeRoleRequest(t *testing.T) {
 		req.SetPathValue("account_id", allowedAccount)
 		req.SetPathValue("role_name", "../evil")
 
-		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion, "shared", "")
 
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("期待値 400、実際: %d", rec.Code)
@@ -1271,7 +1272,7 @@ func TestHandleAssumeRoleRequest(t *testing.T) {
 		req.SetPathValue("account_id", "999999999999")
 		req.SetPathValue("role_name", allowedRole)
 
-		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion, "shared", "")
 
 		if rec.Code != http.StatusForbidden {
 			t.Errorf("期待値 403、実際: %d", rec.Code)
@@ -1293,7 +1294,7 @@ func TestHandleAssumeRoleRequest(t *testing.T) {
 		req.SetPathValue("account_id", allowedAccount)
 		req.SetPathValue("role_name", "OtherRole")
 
-		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion, "shared", "")
 
 		if rec.Code != http.StatusForbidden {
 			t.Errorf("期待値 403、実際: %d", rec.Code)
@@ -1315,7 +1316,7 @@ func TestHandleAssumeRoleRequest(t *testing.T) {
 		req.SetPathValue("account_id", allowedAccount)
 		req.SetPathValue("role_name", allowedRole)
 
-		handleAssumeRoleRequest(rec, req, nil, validCfg, target, stsClient, mcpRegion, targetRegion)
+		handleAssumeRoleRequest(rec, req, nil, validCfg, target, stsClient, mcpRegion, targetRegion, "shared", "")
 
 		if rec.Code != http.StatusInternalServerError {
 			t.Errorf("期待値 500、実際: %d", rec.Code)
@@ -1334,7 +1335,7 @@ func TestHandleAssumeRoleRequest(t *testing.T) {
 		req.SetPathValue("role_name", allowedRole)
 		emptyUser := &idproxy.User{Email: "alice@example.com", Subject: ""}
 
-		handleAssumeRoleRequest(rec, req, emptyUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+		handleAssumeRoleRequest(rec, req, emptyUser, validCfg, target, stsClient, mcpRegion, targetRegion, "shared", "")
 
 		if rec.Code != http.StatusInternalServerError {
 			t.Errorf("期待値 500、実際: %d", rec.Code)
@@ -1353,7 +1354,7 @@ func TestHandleAssumeRoleRequest(t *testing.T) {
 		req.SetPathValue("account_id", allowedAccount)
 		req.SetPathValue("role_name", allowedRole)
 
-		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion, "shared", "")
 
 		if rec.Code != http.StatusForbidden {
 			t.Errorf("期待値 403、実際: %d", rec.Code)
@@ -1379,13 +1380,286 @@ func TestHandleAssumeRoleRequest(t *testing.T) {
 		req.SetPathValue("account_id", allowedAccount)
 		req.SetPathValue("role_name", allowedRole)
 
-		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion)
+		handleAssumeRoleRequest(rec, req, validUser, validCfg, target, stsClient, mcpRegion, targetRegion, "shared", "")
 
 		if rec.Code != http.StatusServiceUnavailable {
 			t.Errorf("期待値 503、実際: %d", rec.Code)
 		}
 		t.Logf("✓ STS Throttling: status=%d", rec.Code)
 	})
+}
+
+// --- federated assumerole テスト ---
+
+// mockFederatedSTS は AssumeRoleWithWebIdentity / AssumeRole を実装するテスト用モック。
+// TestHandleAssumeRoleRequest_Federated_* テストで newWebIdentitySTSClient / newChainedSTSClient 注入に使用する。
+type mockFederatedSTS struct {
+	webIdentityErr error
+	assumeRoleErr  error
+}
+
+func (m *mockFederatedSTS) AssumeRoleWithWebIdentity(ctx context.Context, params *sts.AssumeRoleWithWebIdentityInput, optFns ...func(*sts.Options)) (*sts.AssumeRoleWithWebIdentityOutput, error) {
+	if m.webIdentityErr != nil {
+		return nil, m.webIdentityErr
+	}
+	expiry := time.Now().Add(1 * time.Hour)
+	return &sts.AssumeRoleWithWebIdentityOutput{
+		Credentials: &ststypes.Credentials{
+			AccessKeyId:     aws.String("AKIA_WEBID"),
+			SecretAccessKey: aws.String("secret_webid"),
+			SessionToken:    aws.String("token_webid"),
+			Expiration:      &expiry,
+		},
+	}, nil
+}
+
+func (m *mockFederatedSTS) AssumeRole(ctx context.Context, params *sts.AssumeRoleInput, optFns ...func(*sts.Options)) (*sts.AssumeRoleOutput, error) {
+	if m.assumeRoleErr != nil {
+		return nil, m.assumeRoleErr
+	}
+	expiry := time.Now().Add(1 * time.Hour)
+	return &sts.AssumeRoleOutput{
+		Credentials: &ststypes.Credentials{
+			AccessKeyId:     aws.String("AKIA_FEDERATED"),
+			SecretAccessKey: aws.String("secret_federated"),
+			SessionToken:    aws.String("token_federated"),
+			Expiration:      &expiry,
+		},
+	}, nil
+}
+
+// mockWebIdentitySTSClient は AssumeRoleWithWebIdentity / AssumeRole を実装するテスト用モック。
+// TestHandleAssumeRoleRequest_Federated_* テストで newChainedSTSClient 注入に使用する。
+// Deprecated: mockFederatedSTS を使用すること。後方互換のために残す。
+type mockWebIdentitySTSClient struct {
+	err error
+}
+
+func (m *mockWebIdentitySTSClient) AssumeRole(ctx context.Context, params *sts.AssumeRoleInput, optFns ...func(*sts.Options)) (*sts.AssumeRoleOutput, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	expiry := time.Now().Add(1 * time.Hour)
+	return &sts.AssumeRoleOutput{
+		Credentials: &ststypes.Credentials{
+			AccessKeyId:     aws.String("AKIA_FEDERATED"),
+			SecretAccessKey: aws.String("secret_federated"),
+			SessionToken:    aws.String("token_federated"),
+			Expiration:      &expiry,
+		},
+	}, nil
+}
+
+// TestHandleAssumeRoleRequest_Federated_IDTokenMissing は
+// iamMode=federated で user.IDToken="" の場合に 500 を返すことを確認する（fail-closed）。
+func TestHandleAssumeRoleRequest_Federated_IDTokenMissing(t *testing.T) {
+	target, _ := url.Parse("http://upstream.example.invalid/mcp")
+	cfg := assumeRoleConfig{
+		allowedAccounts:  []string{"123456789012"},
+		allowedRoleNames: []string{"AwsMcpGatewayRole"},
+		maxCacheTTL:      1 * time.Hour,
+	}
+
+	cases := []struct {
+		name string
+		user *idproxy.User
+	}{
+		{
+			name: "IDToken が空 → 500",
+			user: &idproxy.User{Email: "alice@example.com", Subject: "sub-alice"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assumeRoleCredsCache = sync.Map{}
+			t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/mcp/assumerole/accounts/123456789012/rolename/AwsMcpGatewayRole", strings.NewReader(`{}`))
+			req.SetPathValue("account_id", "123456789012")
+			req.SetPathValue("role_name", "AwsMcpGatewayRole")
+
+			handleAssumeRoleRequest(rec, req, tc.user, cfg, target, nil, "us-east-1", "ap-northeast-1", "federated", "arn:aws:iam::123456789012:role/FederatedRole")
+
+			if rec.Code != http.StatusInternalServerError {
+				t.Errorf("期待値 500、実際: %d body=%s", rec.Code, rec.Body.String())
+			} else {
+				t.Logf("✓ federated IDToken 欠落時に 500 を返した (body=%q)", strings.TrimSpace(rec.Body.String()))
+			}
+		})
+	}
+}
+
+// TestHandleAssumeRoleRequest_Federated_IDTokenExpired は
+// iamMode=federated で WebIdentity が InvalidIdentityToken エラーを返した場合に
+// 401 + WWW-Authenticate ヘッダーを返すことを確認する。
+func TestHandleAssumeRoleRequest_Federated_IDTokenExpired(t *testing.T) {
+	federatedCredsCache = sync.Map{}
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() {
+		federatedCredsCache = sync.Map{}
+		assumeRoleCredsCache = sync.Map{}
+	})
+
+	target, _ := url.Parse("http://upstream.example.invalid/mcp")
+	cfg := assumeRoleConfig{
+		allowedAccounts:  []string{"123456789012"},
+		allowedRoleNames: []string{"AwsMcpGatewayRole"},
+		maxCacheTTL:      1 * time.Hour,
+	}
+
+	// WebIdentity 層で InvalidIdentityToken エラーを返すようにモックする。
+	// handleAssumeRoleRequest 内の getFederatedCreds → federatedCreds.Retrieve() で
+	// このエラーが発生し、401 + WWW-Authenticate を返すことを確認する。
+	invalidTokenErr := &stubAPIError{code: "InvalidIdentityToken", msg: "token is expired"}
+	mockSTS := &mockFederatedSTS{webIdentityErr: invalidTokenErr}
+
+	origNewWebIdentitySTSClient := newWebIdentitySTSClient
+	origNewChainedSTSClient := newChainedSTSClient
+	t.Cleanup(func() {
+		newWebIdentitySTSClient = origNewWebIdentitySTSClient
+		newChainedSTSClient = origNewChainedSTSClient
+	})
+	newWebIdentitySTSClient = func(ctx context.Context, region string) (stscreds.AssumeRoleWithWebIdentityAPIClient, error) {
+		return mockSTS, nil
+	}
+	newChainedSTSClient = func(ctx context.Context, region string, creds aws.CredentialsProvider) (stscreds.AssumeRoleAPIClient, error) {
+		return mockSTS, nil
+	}
+
+	user := &idproxy.User{
+		Email:   "alice@example.com",
+		Subject: "sub-alice",
+		IDToken: "eyJhbGciOiJSUzI1NiJ9.expired-token",
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/mcp/assumerole/accounts/123456789012/rolename/AwsMcpGatewayRole", strings.NewReader(`{}`))
+	req.SetPathValue("account_id", "123456789012")
+	req.SetPathValue("role_name", "AwsMcpGatewayRole")
+
+	handleAssumeRoleRequest(rec, req, user, cfg, target, nil, "us-east-1", "ap-northeast-1", "federated", "arn:aws:iam::123456789012:role/FederatedRole")
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("期待値 401、実際: %d body=%s", rec.Code, rec.Body.String())
+	}
+	wwwAuth := rec.Header().Get("WWW-Authenticate")
+	if !strings.Contains(wwwAuth, "invalid_token") {
+		t.Errorf("WWW-Authenticate ヘッダーに invalid_token が含まれていない: %q", wwwAuth)
+	}
+	t.Logf("✓ federated IDToken 失効時に 401 + WWW-Authenticate を返した: status=%d header=%q", rec.Code, wwwAuth)
+}
+
+// TestHandleAssumeRoleRequest_Federated_Success は
+// iamMode=federated で正常に AssumeRole 成功した場合に SigV4 署名リクエストが proxy に到達することを確認する。
+func TestHandleAssumeRoleRequest_Federated_Success(t *testing.T) {
+	federatedCredsCache = sync.Map{}
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() {
+		federatedCredsCache = sync.Map{}
+		assumeRoleCredsCache = sync.Map{}
+	})
+
+	// モックアップストリームサーバー（Authorization ヘッダーをキャプチャ）
+	var capturedAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+	cfg := assumeRoleConfig{
+		allowedAccounts:  []string{"123456789012"},
+		allowedRoleNames: []string{"AwsMcpGatewayRole"},
+		maxCacheTTL:      1 * time.Hour,
+	}
+
+	// WebIdentity / AssumeRole 両方を成功させるモックを注入する。
+	mockSTS := &mockFederatedSTS{}
+
+	origNewWebIdentitySTSClient := newWebIdentitySTSClient
+	origNewChainedSTSClient := newChainedSTSClient
+	t.Cleanup(func() {
+		newWebIdentitySTSClient = origNewWebIdentitySTSClient
+		newChainedSTSClient = origNewChainedSTSClient
+	})
+	newWebIdentitySTSClient = func(ctx context.Context, region string) (stscreds.AssumeRoleWithWebIdentityAPIClient, error) {
+		return mockSTS, nil
+	}
+	newChainedSTSClient = func(ctx context.Context, region string, creds aws.CredentialsProvider) (stscreds.AssumeRoleAPIClient, error) {
+		return mockSTS, nil
+	}
+
+	user := &idproxy.User{
+		Email:   "alice@example.com",
+		Subject: "sub-alice",
+		IDToken: "eyJhbGciOiJSUzI1NiJ9.valid-token",
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/mcp/assumerole/accounts/123456789012/rolename/AwsMcpGatewayRole",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+	req.SetPathValue("account_id", "123456789012")
+	req.SetPathValue("role_name", "AwsMcpGatewayRole")
+
+	handleAssumeRoleRequest(rec, req, user, cfg, target, nil, "us-east-1", "ap-northeast-1", "federated", "arn:aws:iam::123456789012:role/FederatedRole")
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("期待値 200、実際: %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.HasPrefix(capturedAuth, "AWS4-HMAC-SHA256") {
+		t.Errorf("federated SigV4 Authorization ヘッダーが付いていない: %q", capturedAuth)
+	}
+	t.Logf("✓ federated 正常系: status=%d Authorization=%s...", rec.Code, capturedAuth[:min(50, len(capturedAuth))])
+}
+
+// TestGetFederatedCreds_CacheHit は getFederatedCreds の同一 sub+fingerprint でキャッシュヒットすることを確認する。
+func TestGetFederatedCreds_CacheHit(t *testing.T) {
+	federatedCredsCache = sync.Map{}
+	t.Cleanup(func() { federatedCredsCache = sync.Map{} })
+
+	// WebIdentity STS をモックして実際の STS 呼び出しを防ぐ。
+	origNewWebIdentitySTSClient := newWebIdentitySTSClient
+	t.Cleanup(func() { newWebIdentitySTSClient = origNewWebIdentitySTSClient })
+	newWebIdentitySTSClient = func(ctx context.Context, region string) (stscreds.AssumeRoleWithWebIdentityAPIClient, error) {
+		return &mockFederatedSTS{}, nil
+	}
+
+	ctx := context.Background()
+	const (
+		region  = "us-east-1"
+		roleARN = "arn:aws:iam::111:role/Fed"
+		idToken = "test-federated-token"
+		sub     = "sub-fedcache-test"
+	)
+
+	// 1 回目（cache miss）
+	creds1, key1, err1 := getFederatedCreds(ctx, region, roleARN, idToken, sub, "")
+	if err1 != nil {
+		t.Fatalf("1回目 getFederatedCreds エラー: %v", err1)
+	}
+	if creds1 == nil {
+		t.Fatal("1回目: creds が nil")
+	}
+
+	// 2 回目（cache hit）
+	creds2, key2, err2 := getFederatedCreds(ctx, region, roleARN, idToken, sub, "")
+	if err2 != nil {
+		t.Fatalf("2回目 getFederatedCreds エラー: %v", err2)
+	}
+	if creds2 == nil {
+		t.Fatal("2回目: creds が nil")
+	}
+
+	if key1 != key2 {
+		t.Errorf("cacheKey が異なる: 1回目=%q 2回目=%q", key1, key2)
+	}
+	if creds1 != creds2 {
+		t.Errorf("CredentialsCache が再構築された（キャッシュ不動作）: creds1=%p creds2=%p", creds1, creds2)
+	}
+	t.Logf("✓ getFederatedCreds キャッシュヒット: key=%q ptr=%p", key1, creds1)
 }
 
 // TestAssumeRoleEndpointRouting: /mcp/assumerole/{account_id}/{role_name} が

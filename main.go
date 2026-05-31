@@ -159,16 +159,38 @@ func tokenFingerprint(idToken string) string {
 	return hex.EncodeToString(h[:4])
 }
 
-// getFederatedRoundTripper は (sub, idToken, assumeRoleARN) をキーに CredentialsCache をキャッシュし、
-// per-user SigV4 RoundTripper を返す。同一トークンでの二回目以降は STS 呼び出しなし。
+// newWebIdentitySTSClient は WebIdentityRoleProvider に渡す STS クライアントを生成する。
+// テストでオーバーライド可能な関数変数として公開することで、federated モードの
+// WebIdentity STS 呼び出しをモック可能にする（本番コードは変更せず、テスト時のみ差し替える）。
+var newWebIdentitySTSClient = func(ctx context.Context, region string) (stscreds.AssumeRoleWithWebIdentityAPIClient, error) {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWS config for WebIdentity STS client: %w", err)
+	}
+	return sts.NewFromConfig(cfg), nil
+}
+
+// newChainedSTSClient は WebIdentity CredentialsProvider をラップした baseCfg から
+// AssumeRole 用 STS クライアントを生成する。
+// テストでオーバーライド可能な関数変数として公開することで、federated assumerole
+// パスのモックを可能にする（本番コードは変更せず、テスト時のみ差し替える）。
+var newChainedSTSClient = func(ctx context.Context, region string, creds aws.CredentialsProvider) (stscreds.AssumeRoleAPIClient, error) {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWS config for chained STS client: %w", err)
+	}
+	cfg.Credentials = creds
+	return sts.NewFromConfig(cfg), nil
+}
+
+// getFederatedCreds は (sub, idToken, assumeRoleARN) をキーに CredentialsCache をキャッシュし、
+// per-user の CredentialsCache と cacheKey を返す。
+// getFederatedRoundTripper および getFederatedCredsForAssumeRole から共通で利用する。
 //
 // assumeRoleARN が空でない場合はロールチェーンを構成する:
 //
 //	OIDC IDToken → roleARN (AssumeRoleWithWebIdentity) → assumeRoleARN (AssumeRole)
-//
-// ユーザー別の CloudTrail 追跡（RoleSessionName = gw-{sub}）は roleARN の
-// セッション名で引き続き機能する。
-func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idToken, sub, assumeRoleARN string) (*sigV4RoundTripper, error) {
+func getFederatedCreds(ctx context.Context, region, roleARN, idToken, sub, assumeRoleARN string) (*aws.CredentialsCache, string, error) {
 	cacheKey := sub + "::" + tokenFingerprint(idToken)
 	if assumeRoleARN != "" {
 		cacheKey = cacheKey + "::" + assumeRoleARN
@@ -176,7 +198,7 @@ func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idT
 
 	if cached, ok := federatedCredsCache.Load(cacheKey); ok {
 		creds := cached.(*aws.CredentialsCache)
-		return makeFederatedRoundTripper(creds, cacheKey, region, service), nil
+		return creds, cacheKey, nil
 	}
 
 	// cache miss: 同一 sub で異なるトークン fingerprint のエントリを削除（メモリリーク防止）。
@@ -190,16 +212,14 @@ func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idT
 		return true
 	})
 
-	baseCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
-	if err != nil {
-		return nil, fmt.Errorf("failed to load AWS config for federated role: %w", err)
-	}
-
 	// cache miss パスのみで sessionName を計算する（キャッシュヒット時は不要な処理をスキップ）
 	sessionName := sanitizeSessionName("gw-" + sub)
 
-	stsClient := sts.NewFromConfig(baseCfg)
-	provider := stscreds.NewWebIdentityRoleProvider(stsClient, roleARN, staticTokenRetriever(idToken),
+	webIdSTS, err := newWebIdentitySTSClient(ctx, region)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create WebIdentity STS client: %w", err)
+	}
+	provider := stscreds.NewWebIdentityRoleProvider(webIdSTS, roleARN, staticTokenRetriever(idToken),
 		func(o *stscreds.WebIdentityRoleOptions) {
 			o.RoleSessionName = sessionName
 		},
@@ -210,11 +230,12 @@ func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idT
 	// チェーン込みの CredentialsCache をキャッシュするため、キャッシュヒット後は
 	// 追加の STS:AssumeRole 呼び出しが発生しない。
 	if assumeRoleARN != "" {
-		// baseCfg を値コピーし Credentials のみ差し替える。
+		// newChainedSTSClient で baseCfg を値コピーし Credentials のみ差し替える。
 		// これにより FIPS・DualStack・VPC エンドポイント・Retryer 等の設定が継承される。
-		chainCfg := baseCfg
-		chainCfg.Credentials = credsProvider
-		chainSTS := sts.NewFromConfig(chainCfg)
+		chainSTS, cerr := newChainedSTSClient(ctx, region, credsProvider)
+		if cerr != nil {
+			return nil, "", cerr
+		}
 		chainProvider := stscreds.NewAssumeRoleProvider(chainSTS, assumeRoleARN, func(o *stscreds.AssumeRoleOptions) {
 			o.RoleSessionName = sanitizeSessionName("gw-" + sub + "-chain")
 		})
@@ -227,6 +248,19 @@ func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idT
 	actual, _ := federatedCredsCache.LoadOrStore(cacheKey, newCreds)
 	creds := actual.(*aws.CredentialsCache)
 
+	return creds, cacheKey, nil
+}
+
+// getFederatedRoundTripper は getFederatedCreds を呼び出し、
+// per-user SigV4 RoundTripper を返す。後方互換を維持するためのラッパー。
+//
+// ユーザー別の CloudTrail 追跡（RoleSessionName = gw-{sub}）は roleARN の
+// セッション名で引き続き機能する。
+func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idToken, sub, assumeRoleARN string) (*sigV4RoundTripper, error) {
+	creds, cacheKey, err := getFederatedCreds(ctx, region, roleARN, idToken, sub, assumeRoleARN)
+	if err != nil {
+		return nil, err
+	}
 	return makeFederatedRoundTripper(creds, cacheKey, region, service), nil
 }
 
@@ -658,7 +692,7 @@ func main() {
 	// Go 1.22+ の net/http パターンマッチングで自動的に優先される。
 	http.Handle("/mcp/assumerole/accounts/{account_id}/rolename/{role_name}", auth.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user := idproxy.UserFromContext(r.Context())
-		handleAssumeRoleRequest(w, r, user, assumeRoleCfg, target, stsClient, mcpRegion, targetAWSRegion)
+		handleAssumeRoleRequest(w, r, user, assumeRoleCfg, target, stsClient, mcpRegion, targetAWSRegion, iamMode, federatedRoleARN)
 	})))
 
 	// Log OIDC user identity on every authenticated request for audit traceability.
@@ -731,13 +765,20 @@ func buildAssumeRoleARN(accountID, roleName string) string {
 	return fmt.Sprintf("arn:aws:iam::%s:role/%s", accountID, roleName)
 }
 
-// getAssumeRoleCredentials は (accountID, roleName, sub) をキーに CredentialsCache をキャッシュし、
+// getAssumeRoleCredentials は (accountID, roleName, sub[, tokenFP]) をキーに CredentialsCache をキャッシュし、
 // AssumeRole による per-user クレデンシャルを返す。
 // maxCacheTTL 経過後はエントリを削除して再作成する（メモリリーク防止）。
 // AccessDenied 時はキャッシュエントリを削除してエラーを返す。
 // Throttling 等の transient エラー時はキャッシュを保持してエラーを返す。
-func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRoleAPIClient, accountID, roleName, sub, externalID string, maxTTL time.Duration) (*aws.CredentialsCache, error) {
+//
+// tokenFP が非空の場合（federated モード）はキャッシュキーに追加する。
+// IDToken 更新時に古いキャッシュが再利用されることを防ぐ。
+// shared モードでは空文字を渡して後方互換を維持する。
+func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRoleAPIClient, accountID, roleName, sub, externalID string, maxTTL time.Duration, tokenFP string) (*aws.CredentialsCache, error) {
 	cacheKey := accountID + "::" + roleName + "::" + sub
+	if tokenFP != "" {
+		cacheKey = cacheKey + "::" + tokenFP
+	}
 
 	if cached, ok := assumeRoleCredsCache.Load(cacheKey); ok {
 		entry := cached.(*assumeRoleCacheEntry)
@@ -889,6 +930,11 @@ func isAllowedAssumeRole(cfg assumeRoleConfig, accountID, roleName string) bool 
 // handleAssumeRoleRequest は /mcp/assumerole/accounts/{account_id}/rolename/{role_name} へのリクエストを処理する。
 // バリデーション → allowlist 認可 → STS AssumeRole → SigV4 署名プロキシ の順で処理する。
 // エラーレスポンスには内部詳細（ARN、STS エラー文字列）を含めない（fail-closed）。
+//
+// iamMode が "federated" の場合、stsClient 引数（shared モード用）は無視し、
+// user.IDToken を使って per-user CredentialsCache を生成した上で AssumeRole する。
+// これにより CloudTrail の callerArn に assumed-role/{federatedRole}/gw-{sub} が記録される。
+// shared モードは後方互換を完全維持する。
 func handleAssumeRoleRequest(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -898,6 +944,8 @@ func handleAssumeRoleRequest(
 	stsClient stscreds.AssumeRoleAPIClient,
 	mcpRegion string,
 	targetAWSRegion string,
+	iamMode string,
+	federatedRoleARN string,
 ) {
 	accountID := r.PathValue("account_id")
 	roleName := r.PathValue("role_name")
@@ -931,7 +979,69 @@ func handleAssumeRoleRequest(
 		return
 	}
 
-	creds, err := getAssumeRoleCredentials(r.Context(), stsClient, accountID, roleName, user.Subject, cfg.externalID, cfg.maxCacheTTL)
+	// federated モード: IDToken から per-user STS クライアントを生成し AssumeRole する。
+	// これにより CloudTrail の callerArn に assumed-role/{federatedRole}/gw-{sub} が記録される。
+	// shared モード: 起動時生成のランタイムロール stsClient（引数）をそのまま使う（後方互換）。
+	var tokenFP string
+	if iamMode == "federated" {
+		if user.IDToken == "" {
+			slog.Error("assumerole federated mode requires IDToken but none available",
+				"user_sub", user.Subject,
+				"hint", "ensure StoreIDToken=true and user authenticated via OIDC browser flow",
+			)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		// getFederatedCreds で WebIdentity 認証済み CredentialsCache を取得する。
+		// assumeRoleARN="" を渡して WebIdentity のみのチェーンにする（assumerole 自身が AssumeRole する）。
+		federatedCreds, _, ferr := getFederatedCreds(r.Context(), mcpRegion, federatedRoleARN, user.IDToken, user.Subject, "")
+		if ferr != nil {
+			slog.Error("assumerole: failed to get federated credentials",
+				"error", ferr.Error(),
+				"user_sub", user.Subject,
+			)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		// getFederatedCreds が返す CredentialsCache の Retrieve() を呼び IDToken の有効性を確認する。
+		// WebIdentity エラー（InvalidIdentityToken 等）をこの時点で HTTP ステータスへ変換する。
+		// 注意: InvalidIdentityToken が smithy.APIError として伝播するかは SDK の実装依存。
+		if _, ferr = federatedCreds.Retrieve(r.Context()); ferr != nil {
+			switch classifyFederatedError(ferr) {
+			case federatedErrInvalidToken:
+				slog.Warn("assumerole federated STS rejected ID Token, client should re-authenticate",
+					"error", ferr.Error(), "account_id", accountID, "role_name", roleName)
+				w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="OIDC ID Token expired or invalid"`)
+				http.Error(w, "invalid_token", http.StatusUnauthorized)
+			case federatedErrForbidden:
+				slog.Warn("assumerole federated STS denied access",
+					"error", ferr.Error(), "account_id", accountID, "role_name", roleName)
+				http.Error(w, "forbidden", http.StatusForbidden)
+			default:
+				slog.Error("assumerole federated STS transient error",
+					"error", ferr.Error(), "account_id", accountID, "role_name", roleName)
+				http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			}
+			return
+		}
+
+		// federated CredentialsCache から AssumeRole 用の STS クライアントを生成する。
+		// baseCfg を値コピーし Credentials のみ差し替えるため FIPS・Retryer 等の設定が継承される。
+		chainSTS, cerr := newChainedSTSClient(r.Context(), mcpRegion, federatedCreds)
+		if cerr != nil {
+			slog.Error("assumerole: failed to create chained STS client",
+				"error", cerr.Error(), "user_sub", user.Subject)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+		stsClient = chainSTS
+		// federated モードではキャッシュキーに tokenFingerprint を追加して IDToken 更新時に再生成する。
+		tokenFP = tokenFingerprint(user.IDToken)
+	}
+
+	creds, err := getAssumeRoleCredentials(r.Context(), stsClient, accountID, roleName, user.Subject, cfg.externalID, cfg.maxCacheTTL, tokenFP)
 	if err != nil {
 		slog.Error("getAssumeRoleCredentials failed",
 			"error", err.Error(),
