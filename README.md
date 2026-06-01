@@ -51,6 +51,7 @@ AWS credentials are resolved automatically from the environment (Lambda executio
 | `ALLOWED_DOMAINS` | Comma-separated allowed email domains (e.g. `example.com,corp.example.com`). If both are unset, **any user in the OIDC tenant can authenticate** — a warning is logged but the gateway still starts. Case-insensitive. Note: the allowlist is only checked at login time; issued tokens remain valid until expiry even if the allowlist is tightened. | none |
 | `ALLOWED_EMAILS` | Comma-separated allowed email addresses. Combined with `ALLOWED_DOMAINS` (OR logic). Case-insensitive. | none |
 | `COOKIE_SECRET` | Cookie encryption key (hex-encoded, 32+ bytes) | Random (sessions lost on restart) |
+| `SIGNING_KEY_HEX` | OAuth 2.1 JWT signing key (hex-encoded PKCS8 DER). **Required for multi-instance deployments** (Lambda concurrent executions, multiple ECS tasks). Without it, each instance generates an ephemeral key and tokens issued by one instance fail verification on another. Generate: `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -outform DER -out signing.key && xxd -p -c 0 signing.key` | Random (intermittent token verification failures across instances) |
 | `AWS_MCP_ENDPOINT` | AWS MCP Server endpoint URL (overrides `AWS_MCP_REGION`) | derived from `AWS_MCP_REGION` |
 | `AWS_MCP_REGION` | Region of the AWS MCP Server endpoint | `us-east-1` |
 | `TARGET_AWS_REGION` | Default AWS region for API operations | `ap-northeast-1` |
@@ -580,6 +581,7 @@ export OIDC_ISSUER=https://login.microsoftonline.com/{tenant-id}/v2.0
 export OIDC_CLIENT_ID=your-client-id
 export OIDC_CLIENT_SECRET=your-client-secret
 export COOKIE_SECRET=$(openssl rand -hex 32)
+export SIGNING_KEY_HEX=$(openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -outform DER 2>/dev/null | xxd -p -c 0)
 
 aws-mcp-gateway
 ```

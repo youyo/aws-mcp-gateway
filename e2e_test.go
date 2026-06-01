@@ -2296,6 +2296,39 @@ func TestGetAssumeRoleCredentials_OldTokenFPEvicted(t *testing.T) {
 	}
 }
 
+// TestLoggingProxyPattern_OversizedBody は loggingProxy の shared モードパスで
+// MaxBytesReader + injectMetaAWSRegion の組み合わせが oversized body を正しく拒否することを確認する。
+// loggingProxy は main() 内クロージャで定義されるため直接テストできないが、
+// 同一コードパターン（MaxBytesReader → injectMetaAWSRegion → 400）を再現してリグレッションを防ぐ。
+func TestLoggingProxyPattern_OversizedBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// loggingProxy の shared モードと同じパターン
+		if r.Body != nil && r.Body != http.NoBody {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		}
+		r, ok := injectMetaAWSRegion(r, "ap-northeast-1")
+		if !ok {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	body := io.LimitReader(neverEndingByteReader{}, int64(maxRequestBodyBytes)+1)
+	resp, err := http.Post(srv.URL+"/mcp", "application/json", body)
+	if err != nil {
+		t.Fatalf("リクエスト失敗: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("oversized body: 期待値 400、実際: %d", resp.StatusCode)
+	} else {
+		t.Logf("✓ loggingProxy パターン: oversized body（>%d bytes）に対して 400 を返した", maxRequestBodyBytes)
+	}
+}
+
 // TestHandleAssumeRoleRequest_OversizedBody は maxRequestBodyBytes を超えるボディが
 // handleAssumeRoleRequest で 400 を返すことを確認する（MaxBytesReader の実動作検証）。
 // STS モックで AssumeRole を成功させ、injectMetaAWSRegion のボディ読み取りまで到達させる。

@@ -95,6 +95,11 @@ export class AwsMcpGatewayStack extends cdk.Stack {
     const oidcClientId = ssm.StringParameter.valueForStringParameter(this, `/${instanceName}/OIDC_CLIENT_ID`);
     const oidcClientSecret = ssm.StringParameter.valueForStringParameter(this, `/${instanceName}/OIDC_CLIENT_SECRET`);
     const cookieSecret = ssm.StringParameter.valueForStringParameter(this, `/${instanceName}/COOKIE_SECRET`);
+    // SIGNING_KEY_HEX: OAuth 2.1 JWT 署名鍵（PKCS8 DER の hex エンコード）
+    // Lambda 並行実行（複数インスタンス）でインスタンス間のトークン検証が成功するために必須。
+    // COOKIE_SECRET と同様に全インスタンスで同一の値を共有する必要がある。
+    // 生成: openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -outform DER -out signing.key && xxd -p -c 0 signing.key
+    const signingKeyHex = ssm.StringParameter.valueForStringParameter(this, `/${instanceName}/SIGNING_KEY_HEX`);
     const dynamodbTable = ssm.StringParameter.valueForStringParameter(this, `/${instanceName}/DYNAMODB_TABLE`);
     const dynamodbRegion = ssm.StringParameter.valueForStringParameter(this, `/${instanceName}/DYNAMODB_REGION`);
 
@@ -117,6 +122,7 @@ export class AwsMcpGatewayStack extends cdk.Stack {
         OIDC_CLIENT_ID: oidcClientId,
         OIDC_CLIENT_SECRET: oidcClientSecret,
         COOKIE_SECRET: cookieSecret,
+        SIGNING_KEY_HEX: signingKeyHex,
         AWS_MCP_REGION: awsMcpRegion,
         TARGET_AWS_REGION: targetAwsRegion,
         AWS_LWA_INVOKE_MODE: 'response_stream',
