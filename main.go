@@ -187,10 +187,13 @@ var newChainedSTSClient = func(ctx context.Context, region string, creds aws.Cre
 // per-user の CredentialsCache と cacheKey を返す。
 // getFederatedRoundTripper および handleAssumeRoleRequest から共通で利用する。
 //
+// email が非空の場合は RoleSessionName に email を使用する（CloudTrail の可読性向上）。
+// cacheKey は引き続き sub ベースで変更しない（email は変わりうるため）。
+//
 // assumeRoleARN が空でない場合はロールチェーンを構成する:
 //
 //	OIDC IDToken → roleARN (AssumeRoleWithWebIdentity) → assumeRoleARN (AssumeRole)
-func getFederatedCreds(ctx context.Context, region, roleARN, idToken, sub, assumeRoleARN string) (*aws.CredentialsCache, string, error) {
+func getFederatedCreds(ctx context.Context, region, roleARN, idToken, sub, email, assumeRoleARN string) (*aws.CredentialsCache, string, error) {
 	cacheKey := sub + "::" + tokenFingerprint(idToken)
 	if assumeRoleARN != "" {
 		cacheKey = cacheKey + "::" + assumeRoleARN
@@ -213,7 +216,8 @@ func getFederatedCreds(ctx context.Context, region, roleARN, idToken, sub, assum
 	})
 
 	// cache miss パスのみで sessionName を計算する（キャッシュヒット時は不要な処理をスキップ）
-	sessionName := sanitizeSessionName("gw-" + sub)
+	// email が非空なら email を使用して CloudTrail の可読性を向上させる。cacheKey は sub ベースのまま。
+	sessionName := sanitizeSessionName("gw-" + sessionIdentifier(email, sub))
 
 	webIdSTS, err := newWebIdentitySTSClient(ctx, region)
 	if err != nil {
@@ -237,7 +241,7 @@ func getFederatedCreds(ctx context.Context, region, roleARN, idToken, sub, assum
 			return nil, "", cerr
 		}
 		chainProvider := stscreds.NewAssumeRoleProvider(chainSTS, assumeRoleARN, func(o *stscreds.AssumeRoleOptions) {
-			o.RoleSessionName = sanitizeSessionName("gw-" + sub + "-chain")
+			o.RoleSessionName = sanitizeSessionName("gw-" + sessionIdentifier(email, sub) + "-chain")
 		})
 		credsProvider = chainProvider
 	}
@@ -254,10 +258,10 @@ func getFederatedCreds(ctx context.Context, region, roleARN, idToken, sub, assum
 // getFederatedRoundTripper は getFederatedCreds を呼び出し、
 // per-user SigV4 RoundTripper を返す。後方互換を維持するためのラッパー。
 //
-// ユーザー別の CloudTrail 追跡（RoleSessionName = gw-{sub}）は roleARN の
-// セッション名で引き続き機能する。
-func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idToken, sub, assumeRoleARN string) (*sigV4RoundTripper, error) {
-	creds, cacheKey, err := getFederatedCreds(ctx, region, roleARN, idToken, sub, assumeRoleARN)
+// email が非空の場合は RoleSessionName に email を使用する（CloudTrail の可読性向上）。
+// cacheKey は sub ベースのまま変更しない。
+func getFederatedRoundTripper(ctx context.Context, region, service, roleARN, idToken, sub, email, assumeRoleARN string) (*sigV4RoundTripper, error) {
+	creds, cacheKey, err := getFederatedCreds(ctx, region, roleARN, idToken, sub, email, assumeRoleARN)
 	if err != nil {
 		return nil, err
 	}
@@ -314,6 +318,16 @@ type staticTokenRetriever string
 
 func (t staticTokenRetriever) GetIdentityToken() ([]byte, error) {
 	return []byte(t), nil
+}
+
+// sessionIdentifier は STS RoleSessionName に使う識別子を返す。
+// email が非空なら email を、空なら sub を返す。
+// cacheKey には使わず、session name の計算のみに使用する。
+func sessionIdentifier(email, sub string) string {
+	if email != "" {
+		return email
+	}
+	return sub
 }
 
 // sanitizeSessionName removes characters not allowed in STS RoleSessionName and truncates to 64 chars.
@@ -498,7 +512,7 @@ func handleFederatedRequest(w http.ResponseWriter, r *http.Request, user *idprox
 		return
 	}
 
-	federatedTransport, ferr := getFederatedRoundTripper(r.Context(), cfg.mcpRegion, cfg.awsMCPService, cfg.federatedRoleARN, user.IDToken, user.Subject, cfg.assumeRoleARN)
+	federatedTransport, ferr := getFederatedRoundTripper(r.Context(), cfg.mcpRegion, cfg.awsMCPService, cfg.federatedRoleARN, user.IDToken, user.Subject, user.Email, cfg.assumeRoleARN)
 	if ferr != nil {
 		slog.Error("failed to get federated round tripper", "error", ferr.Error(), "user_sub", user.Subject)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
@@ -775,10 +789,13 @@ func buildAssumeRoleARN(accountID, roleName string) string {
 // AccessDenied 時はキャッシュエントリを削除してエラーを返す。
 // Throttling 等の transient エラー時はキャッシュを保持してエラーを返す。
 //
+// email が非空の場合は RoleSessionName に email を使用する（CloudTrail の可読性向上）。
+// cacheKey は sub ベースのまま変更しない（email は変わりうるため）。
+//
 // tokenFP が非空の場合（federated モード）はキャッシュキーに追加する。
 // IDToken 更新時に古いキャッシュが再利用されることを防ぐ。
 // shared モードでは空文字を渡して後方互換を維持する。
-func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRoleAPIClient, accountID, roleName, sub, externalID string, maxTTL time.Duration, tokenFP string) (*aws.CredentialsCache, error) {
+func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRoleAPIClient, accountID, roleName, sub, email, externalID string, maxTTL time.Duration, tokenFP string) (*aws.CredentialsCache, error) {
 	cacheKey := accountID + "::" + roleName + "::" + sub
 	if tokenFP != "" {
 		cacheKey = cacheKey + "::" + tokenFP
@@ -794,7 +811,8 @@ func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRole
 	}
 
 	roleARN := buildAssumeRoleARN(accountID, roleName)
-	sessionName := sanitizeSessionName("gw-ar-" + sub)
+	// email が非空なら email を使用して CloudTrail の可読性を向上させる。cacheKey は sub ベースのまま。
+	sessionName := sanitizeSessionName("gw-ar-" + sessionIdentifier(email, sub))
 
 	// STS セッション期間はデフォルト（1 時間）を使用する。
 	// maxTTL はローカルキャッシュの退避 TTL であり STS セッション期間とは独立。
@@ -999,7 +1017,7 @@ func handleAssumeRoleRequest(
 
 		// getFederatedCreds で WebIdentity 認証済み CredentialsCache を取得する。
 		// assumeRoleARN="" を渡して WebIdentity のみのチェーンにする（assumerole 自身が AssumeRole する）。
-		federatedCreds, federatedCacheKey, ferr := getFederatedCreds(r.Context(), mcpRegion, federatedRoleARN, user.IDToken, user.Subject, "")
+		federatedCreds, federatedCacheKey, ferr := getFederatedCreds(r.Context(), mcpRegion, federatedRoleARN, user.IDToken, user.Subject, user.Email, "")
 		if ferr != nil {
 			slog.Error("assumerole: failed to get federated credentials",
 				"error", ferr.Error(),
@@ -1051,7 +1069,7 @@ func handleAssumeRoleRequest(
 		tokenFP = tokenFingerprint(user.IDToken)
 	}
 
-	creds, err := getAssumeRoleCredentials(r.Context(), stsClient, accountID, roleName, user.Subject, cfg.externalID, cfg.maxCacheTTL, tokenFP)
+	creds, err := getAssumeRoleCredentials(r.Context(), stsClient, accountID, roleName, user.Subject, user.Email, cfg.externalID, cfg.maxCacheTTL, tokenFP)
 	if err != nil {
 		slog.Error("getAssumeRoleCredentials failed",
 			"error", err.Error(),
@@ -1085,7 +1103,7 @@ func handleAssumeRoleRequest(
 	}
 
 	roleARN := buildAssumeRoleARN(accountID, roleName)
-	sessionName := sanitizeSessionName("gw-ar-" + user.Subject)
+	sessionName := sanitizeSessionName("gw-ar-" + sessionIdentifier(user.Email, user.Subject))
 	slog.Info("assumerole request",
 		"account_id", accountID,
 		"role_name", roleName,
