@@ -2227,6 +2227,29 @@ func TestLoadSigningKey_InvalidHex(t *testing.T) {
 	t.Logf("✓ 不正な hex に対してエラーを返した: %v", err)
 }
 
+// TestLoadSigningKey_SEC1Format は SEC1 形式（macOS LibreSSL が出力する旧来 EC フォーマット）
+// の鍵を正しくロードできることを確認する。
+func TestLoadSigningKey_SEC1Format(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("テスト用鍵生成失敗: %v", err)
+	}
+	sec1DER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("SEC1 マーシャル失敗: %v", err)
+	}
+	t.Setenv("SIGNING_KEY_HEX", hex.EncodeToString(sec1DER))
+
+	got, err := loadSigningKey()
+	if err != nil {
+		t.Fatalf("SEC1 形式のロード失敗: %v", err)
+	}
+	if !got.PublicKey.Equal(&key.PublicKey) {
+		t.Error("ロードした鍵が期待値と一致しない")
+	}
+	t.Logf("✓ SEC1 形式の鍵を正しくロードした（macOS LibreSSL 互換性確認）")
+}
+
 // TestLoadSigningKey_WrongKeyType は SIGNING_KEY_HEX に P-256 以外の鍵（P-384）が
 // 設定された場合にエラーを返すことを確認する。
 // idproxy は ES256（ECDSA P-256）を要求するため、P-256 以外は起動時に reject する。

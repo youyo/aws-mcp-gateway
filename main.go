@@ -581,20 +581,33 @@ func handleFederatedRequest(w http.ResponseWriter, r *http.Request, user *idprox
 // 共有する必要がある。idproxy はトークン検証にローカル署名検証を使用するため、
 // インスタンス A が発行した JWT をインスタンス B が検証できなくなる。
 //
-// SIGNING_KEY_HEX の生成手順（PKCS8 DER を hex エンコード）:
+// SIGNING_KEY_HEX の生成手順（Go の x509.MarshalPKCS8PrivateKey が出力する PKCS8 DER を推奨）:
 //
-//	openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -outform DER -out signing.key
-//	xxd -p -c 0 signing.key
+//	go run -e 'package main; import ("crypto/ecdsa";"crypto/elliptic";"crypto/rand";"crypto/x509";"encoding/hex";"fmt"); func main() {k,_:=ecdsa.GenerateKey(elliptic.P256(),rand.Reader);d,_:=x509.MarshalPKCS8PrivateKey(k);fmt.Print(hex.EncodeToString(d))}'
+//
+// PKCS8 DER と SEC1 DER の両フォーマットを受け付ける。
+// macOS 標準の LibreSSL は openssl genpkey でも SEC1 を出力する場合があるため。
 func loadSigningKey() (*ecdsa.PrivateKey, error) {
 	keyHex := strings.TrimSpace(os.Getenv("SIGNING_KEY_HEX"))
 	if keyHex != "" {
 		keyDER, err := hex.DecodeString(keyHex)
 		if err != nil {
-			return nil, fmt.Errorf("invalid SIGNING_KEY_HEX: must be hex-encoded PKCS8 DER: %w", err)
+			return nil, fmt.Errorf("invalid SIGNING_KEY_HEX: must be hex-encoded DER: %w", err)
 		}
+		// PKCS8 DER を優先して試みる
 		parsed, err := x509.ParsePKCS8PrivateKey(keyDER)
 		if err != nil {
-			return nil, fmt.Errorf("invalid SIGNING_KEY_HEX: failed to parse PKCS8: %w", err)
+			// macOS LibreSSL は openssl genpkey でも SEC1 形式を出力する場合があるため
+			// SEC1 (traditional EC private key format) もフォールバックとして受け付ける
+			ecKey, sec1Err := x509.ParseECPrivateKey(keyDER)
+			if sec1Err != nil {
+				return nil, fmt.Errorf("invalid SIGNING_KEY_HEX: failed to parse as PKCS8 or SEC1 DER: %w", err)
+			}
+			if ecKey.Curve != elliptic.P256() {
+				return nil, fmt.Errorf("invalid SIGNING_KEY_HEX: key must be ECDSA P-256 (got %s)", ecKey.Curve.Params().Name)
+			}
+			slog.Info("using ECDSA signing key from SIGNING_KEY_HEX (SEC1 format)")
+			return ecKey, nil
 		}
 		ecKey, ok := parsed.(*ecdsa.PrivateKey)
 		if !ok {
