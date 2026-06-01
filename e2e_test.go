@@ -903,7 +903,7 @@ func TestGetAssumeRoleCredentials_ExternalId(t *testing.T) {
 		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
 
 		client := &mockAssumeRoleClient{}
-		creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", "sub-extid", "", "my-external-id", 1*time.Hour, "")
+		creds, _, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", "sub-extid", "", "my-external-id", 1*time.Hour, "")
 		if err != nil {
 			t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
 		}
@@ -925,7 +925,7 @@ func TestGetAssumeRoleCredentials_ExternalId(t *testing.T) {
 		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
 
 		client := &mockAssumeRoleClient{}
-		creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", "sub-noextid", "", "", 1*time.Hour, "")
+		creds, _, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", "sub-noextid", "", "", 1*time.Hour, "")
 		if err != nil {
 			t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
 		}
@@ -1038,7 +1038,7 @@ func TestGetAssumeRoleCredentials_SessionName(t *testing.T) {
 
 	longSub := strings.Repeat("a", 100)
 	client := &mockAssumeRoleClient{}
-	creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", longSub, "", "", 1*time.Hour, "")
+	creds, _, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", longSub, "", "", 1*time.Hour, "")
 	if err != nil {
 		t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
 	}
@@ -1069,11 +1069,11 @@ func TestGetAssumeRoleCredentials_CacheHit(t *testing.T) {
 	client := &mockAssumeRoleClient{}
 	ctx := context.Background()
 
-	creds1, err1 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", "", "", 1*time.Hour, "")
+	creds1, _, err1 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", "", "", 1*time.Hour, "")
 	if err1 != nil {
 		t.Fatalf("1回目 getAssumeRoleCredentials エラー: %v", err1)
 	}
-	creds2, err2 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", "", "", 1*time.Hour, "")
+	creds2, _, err2 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", "", "", 1*time.Hour, "")
 	if err2 != nil {
 		t.Fatalf("2回目 getAssumeRoleCredentials エラー: %v", err2)
 	}
@@ -1095,7 +1095,7 @@ func TestGetAssumeRoleCredentials_AccessDenied(t *testing.T) {
 	client := &mockAssumeRoleClient{err: accessDeniedErr}
 	ctx := context.Background()
 
-	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-denied", "", "", 1*time.Hour, "")
+	creds, _, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-denied", "", "", 1*time.Hour, "")
 	if err != nil {
 		t.Fatalf("getAssumeRoleCredentials は AccessDenied をラップして返すはずだが直接エラー: %v", err)
 	}
@@ -1127,7 +1127,7 @@ func TestGetAssumeRoleCredentials_Throttling(t *testing.T) {
 	client := &mockAssumeRoleClient{err: throttleErr}
 	ctx := context.Background()
 
-	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-throttle", "", "", 1*time.Hour, "")
+	creds, _, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-throttle", "", "", 1*time.Hour, "")
 	if err != nil {
 		t.Fatalf("getAssumeRoleCredentials は Throttling をラップして返すはずだが直接エラー: %v", err)
 	}
@@ -1844,7 +1844,7 @@ func TestGetAssumeRoleCredentials_SessionName_Email(t *testing.T) {
 	client := &mockAssumeRoleClient{}
 	const email = "user@example.com"
 	const sub = "sub-test-email"
-	creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", sub, email, "", 1*time.Hour, "")
+	creds, _, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", sub, email, "", 1*time.Hour, "")
 	if err != nil {
 		t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
 	}
@@ -1861,7 +1861,9 @@ func TestGetAssumeRoleCredentials_SessionName_Email(t *testing.T) {
 	captured := client.capturedSessionName
 	client.mu.Unlock()
 
-	want := sanitizeSessionName("gw-ar-" + email)
+	// リテラル期待値: buildSessionName("gw-ar-", email, "") で計算した結果を固定
+	// email = "user@example.com" → "gw-ar-user@example.com" (22文字、64以内)
+	const want = "gw-ar-user@example.com"
 	if captured != want {
 		t.Errorf("RoleSessionName = %q, want %q (email ベース)", captured, want)
 	}
@@ -1876,7 +1878,7 @@ func TestGetAssumeRoleCredentials_SessionName_EmailFallback(t *testing.T) {
 
 	client := &mockAssumeRoleClient{}
 	const sub = "sub-test-fallback"
-	creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", sub, "", "", 1*time.Hour, "")
+	creds, _, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", sub, "", "", 1*time.Hour, "")
 	if err != nil {
 		t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
 	}
@@ -1892,7 +1894,9 @@ func TestGetAssumeRoleCredentials_SessionName_EmailFallback(t *testing.T) {
 	captured := client.capturedSessionName
 	client.mu.Unlock()
 
-	want := sanitizeSessionName("gw-ar-" + sub)
+	// リテラル期待値: buildSessionName("gw-ar-", sub, "") で計算した結果を固定
+	// sub = "sub-test-fallback" → "gw-ar-sub-test-fallback" (23文字、64以内)
+	const want = "gw-ar-sub-test-fallback"
 	if captured != want {
 		t.Errorf("RoleSessionName = %q, want %q (sub フォールバック)", captured, want)
 	}
@@ -1929,7 +1933,9 @@ func TestGetFederatedCreds_SessionName_Email(t *testing.T) {
 	captured := mockSTS.capturedWebIdentityName
 	mockSTS.mu.Unlock()
 
-	want := sanitizeSessionName("gw-" + email)
+	// リテラル期待値: buildSessionName("gw-", email, "") で計算した結果を固定
+	// email = "user@example.com" → "gw-user@example.com" (19文字、64以内)
+	const want = "gw-user@example.com"
 	if captured != want {
 		t.Errorf("WebIdentity RoleSessionName = %q, want %q (email ベース)", captured, want)
 	}
@@ -1965,7 +1971,9 @@ func TestGetFederatedCreds_SessionName_EmailFallback(t *testing.T) {
 	captured := mockSTS.capturedWebIdentityName
 	mockSTS.mu.Unlock()
 
-	want := sanitizeSessionName("gw-" + sub)
+	// リテラル期待値: buildSessionName("gw-", sub, "") で計算した結果を固定
+	// sub = "sub-federated-fallback" → "gw-sub-federated-fallback" (25文字、64以内)
+	const want = "gw-sub-federated-fallback"
 	if captured != want {
 		t.Errorf("WebIdentity RoleSessionName = %q, want %q (sub フォールバック)", captured, want)
 	}
@@ -2021,13 +2029,13 @@ func TestGetAssumeRoleCredentials_CacheKey_EmailDoesNotAffectKey(t *testing.T) {
 	ctx := context.Background()
 
 	// email A で呼び出し（cache miss）
-	creds1, err1 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-emailkey", "emailA@example.com", "", 1*time.Hour, "")
+	creds1, _, err1 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-emailkey", "emailA@example.com", "", 1*time.Hour, "")
 	if err1 != nil {
 		t.Fatalf("1回目（email A）getAssumeRoleCredentials エラー: %v", err1)
 	}
 
 	// 異なる email B で呼び出し（cacheKey は sub ベースなので同一エントリにヒットするべき）
-	creds2, err2 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-emailkey", "emailB@example.com", "", 1*time.Hour, "")
+	creds2, _, err2 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-emailkey", "emailB@example.com", "", 1*time.Hour, "")
 	if err2 != nil {
 		t.Fatalf("2回目（email B）getAssumeRoleCredentials エラー: %v", err2)
 	}
@@ -2036,4 +2044,124 @@ func TestGetAssumeRoleCredentials_CacheKey_EmailDoesNotAffectKey(t *testing.T) {
 		t.Errorf("email が異なると別の CredentialsCache が返った: creds1=%p creds2=%p (同一エントリを返すべき)", creds1, creds2)
 	}
 	t.Logf("✓ email が異なっても同一 CredentialsCache が返った: ptr=%p", creds1)
+}
+
+// TestBuildSessionName はプレフィックス・識別子・サフィックスを受け取り、
+// 合計 64 文字以内に収まりつつサフィックスが保護されることを確認する。
+func TestBuildSessionName(t *testing.T) {
+	tests := []struct {
+		name     string
+		prefix   string
+		id       string
+		suffix   string
+		wantLen  int
+		wantSuffix string
+	}{
+		{
+			name:       "短い識別子: そのまま結合",
+			prefix:     "gw-",
+			id:         "user@example.com",
+			suffix:     "",
+			wantLen:    19,
+			wantSuffix: "",
+		},
+		{
+			name:       "チェーン: 短い email でサフィックス保持",
+			prefix:     "gw-",
+			id:         "user@example.com",
+			suffix:     "-chain",
+			wantLen:    25,
+			wantSuffix: "-chain",
+		},
+		{
+			name:       "チェーン: 長い email でも -chain が保持される",
+			prefix:     "gw-",
+			id:         strings.Repeat("a", 70) + "@example.com",
+			suffix:     "-chain",
+			wantLen:    64,
+			wantSuffix: "-chain",
+		},
+		{
+			name:       "長い email: 64 文字に収まる",
+			prefix:     "gw-ar-",
+			id:         "verylongemailaddress.firstname.lastname@subsidiary.example.co.jp",
+			suffix:     "",
+			wantLen:    64,
+			wantSuffix: "",
+		},
+		{
+			name:       "gw-ar- + 長い email + -chain: -chain 保持",
+			prefix:     "gw-ar-",
+			id:         strings.Repeat("b", 70) + "@example.com",
+			suffix:     "-chain",
+			wantLen:    64,
+			wantSuffix: "-chain",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildSessionName(tt.prefix, tt.id, tt.suffix)
+			if len(got) > 64 {
+				t.Errorf("64 文字超: len=%d, got=%q", len(got), got)
+			}
+			if len(got) != tt.wantLen {
+				t.Errorf("len=%d, want %d, got=%q", len(got), tt.wantLen, got)
+			}
+			if tt.wantSuffix != "" && !strings.HasSuffix(got, tt.wantSuffix) {
+				t.Errorf("サフィックス %q が消失: got=%q", tt.wantSuffix, got)
+			}
+			t.Logf("✓ %s → %q (len=%d)", tt.name, got, len(got))
+		})
+	}
+}
+
+// TestBuildSessionName_ChainNotEqualBase は長い email でも
+// チェーン名と base 名が異なることを確認する（advocate #2 の回帰テスト）。
+func TestBuildSessionName_ChainNotEqualBase(t *testing.T) {
+	longEmail := strings.Repeat("a", 70) + "@example.com"
+	base := buildSessionName("gw-", longEmail, "")
+	chain := buildSessionName("gw-", longEmail, "-chain")
+	if base == chain {
+		t.Errorf("長い email でチェーン名と base 名が同一になった: %q", base)
+	}
+	if !strings.HasSuffix(chain, "-chain") {
+		t.Errorf("chain セッション名に -chain サフィックスがない: %q", chain)
+	}
+	t.Logf("✓ base=%q chain=%q", base, chain)
+}
+
+// TestGetAssumeRoleCredentials_ReturnsSessionName は getAssumeRoleCredentials が
+// 実際に STS に渡したセッション名を返すことを確認する（キャッシュヒット/ミス両方）。
+func TestGetAssumeRoleCredentials_ReturnsSessionName(t *testing.T) {
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+	client := &mockAssumeRoleClient{}
+	const email = "user@returns-session.example.com"
+	const sub = "sub-returns-session"
+
+	// 1回目: キャッシュミス → STS 呼び出し
+	creds, sessionName, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "TestRole", sub, email, "", 1*time.Hour, "")
+	if err != nil {
+		t.Fatalf("1回目エラー: %v", err)
+	}
+	if _, rerr := creds.Retrieve(context.Background()); rerr != nil {
+		t.Fatalf("Retrieve エラー: %v", rerr)
+	}
+	// リテラル期待値で検証
+	wantName := buildSessionName("gw-ar-", email, "")
+	if sessionName != wantName {
+		t.Errorf("sessionName=%q, want %q", sessionName, wantName)
+	}
+	t.Logf("✓ キャッシュミス: sessionName=%q", sessionName)
+
+	// 2回目: キャッシュヒット → 同じセッション名が返る
+	_, sessionName2, err2 := getAssumeRoleCredentials(context.Background(), client, "123456789012", "TestRole", sub, email, "", 1*time.Hour, "")
+	if err2 != nil {
+		t.Fatalf("2回目エラー: %v", err2)
+	}
+	if sessionName2 != sessionName {
+		t.Errorf("キャッシュヒット時のセッション名が不一致: got=%q, want=%q", sessionName2, sessionName)
+	}
+	t.Logf("✓ キャッシュヒット: sessionName=%q (固着確認)", sessionName2)
 }

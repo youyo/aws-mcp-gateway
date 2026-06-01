@@ -217,7 +217,8 @@ func getFederatedCreds(ctx context.Context, region, roleARN, idToken, sub, email
 
 	// cache miss パスのみで sessionName を計算する（キャッシュヒット時は不要な処理をスキップ）
 	// email が非空なら email を使用して CloudTrail の可読性を向上させる。cacheKey は sub ベースのまま。
-	sessionName := sanitizeSessionName("gw-" + sessionIdentifier(email, sub))
+	// buildSessionName でプレフィックス分を除いた残り文字数で識別子を切り詰める。
+	sessionName := buildSessionName("gw-", sessionIdentifier(email, sub), "")
 
 	webIdSTS, err := newWebIdentitySTSClient(ctx, region)
 	if err != nil {
@@ -241,7 +242,9 @@ func getFederatedCreds(ctx context.Context, region, roleARN, idToken, sub, email
 			return nil, "", cerr
 		}
 		chainProvider := stscreds.NewAssumeRoleProvider(chainSTS, assumeRoleARN, func(o *stscreds.AssumeRoleOptions) {
-			o.RoleSessionName = sanitizeSessionName("gw-" + sessionIdentifier(email, sub) + "-chain")
+			// buildSessionName で "-chain" サフィックスを末尾に確保する。
+			// 識別子が長い場合でも "-chain" が消失しない。
+			o.RoleSessionName = buildSessionName("gw-", sessionIdentifier(email, sub), "-chain")
 		})
 		credsProvider = chainProvider
 	}
@@ -345,6 +348,23 @@ func sanitizeSessionName(s string) string {
 		name = name[:64]
 	}
 	return name
+}
+
+// buildSessionName は prefix + sanitize(id) + suffix を組み立て、合計 64 文字以内に収める。
+// suffix（"-chain" 等）を末尾に確保してからその分を identifier から切り詰めることで、
+// suffix が長い identifier によって消失しないことを保証する。
+// STS RoleSessionName は [\w+=,.@-]+ のみ許可するため sanitize を経由する。
+func buildSessionName(prefix, id, suffix string) string {
+	// prefix と suffix は STS 許可文字のみを含む前提（呼び出し側が責任を持つ）
+	maxIDLen := 64 - len(prefix) - len(suffix)
+	if maxIDLen < 0 {
+		maxIDLen = 0
+	}
+	sanitized := sanitizeSessionName(id)
+	if len(sanitized) > maxIDLen {
+		sanitized = sanitized[:maxIDLen]
+	}
+	return prefix + sanitized + suffix
 }
 
 // injectMetaAWSRegion は JSON-RPC リクエストボディの params._meta.AWS_REGION に region を注入する。
@@ -769,9 +789,12 @@ func main() {
 
 // assumeRoleCacheEntry はキャッシュエントリの作成時刻付きラッパー。
 // maxCacheTTL 経過後は強制的に再作成してメモリリークを防ぐ。
+// sessionName には STS に渡した実際の RoleSessionName を保存する。
+// キャッシュヒット時でもログに正確な値を出力できる。
 type assumeRoleCacheEntry struct {
-	creds     *aws.CredentialsCache
-	createdAt time.Time
+	creds       *aws.CredentialsCache
+	createdAt   time.Time
+	sessionName string
 }
 
 // assumeRoleCredsCache はユーザー×ロールごとの *assumeRoleCacheEntry をキャッシュする。
@@ -784,18 +807,19 @@ func buildAssumeRoleARN(accountID, roleName string) string {
 }
 
 // getAssumeRoleCredentials は (accountID, roleName, sub[, tokenFP]) をキーに CredentialsCache をキャッシュし、
-// AssumeRole による per-user クレデンシャルを返す。
+// AssumeRole による per-user クレデンシャルと実際に STS に渡した RoleSessionName を返す。
 // maxCacheTTL 経過後はエントリを削除して再作成する（メモリリーク防止）。
 // AccessDenied 時はキャッシュエントリを削除してエラーを返す。
 // Throttling 等の transient エラー時はキャッシュを保持してエラーを返す。
 //
 // email が非空の場合は RoleSessionName に email を使用する（CloudTrail の可読性向上）。
 // cacheKey は sub ベースのまま変更しない（email は変わりうるため）。
+// キャッシュヒット時は作成時の sessionName を返すため、ログと CloudTrail が一致する。
 //
 // tokenFP が非空の場合（federated モード）はキャッシュキーに追加する。
 // IDToken 更新時に古いキャッシュが再利用されることを防ぐ。
 // shared モードでは空文字を渡して後方互換を維持する。
-func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRoleAPIClient, accountID, roleName, sub, email, externalID string, maxTTL time.Duration, tokenFP string) (*aws.CredentialsCache, error) {
+func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRoleAPIClient, accountID, roleName, sub, email, externalID string, maxTTL time.Duration, tokenFP string) (*aws.CredentialsCache, string, error) {
 	cacheKey := accountID + "::" + roleName + "::" + sub
 	if tokenFP != "" {
 		cacheKey = cacheKey + "::" + tokenFP
@@ -804,7 +828,7 @@ func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRole
 	if cached, ok := assumeRoleCredsCache.Load(cacheKey); ok {
 		entry := cached.(*assumeRoleCacheEntry)
 		if time.Since(entry.createdAt) < maxTTL {
-			return entry.creds, nil
+			return entry.creds, entry.sessionName, nil
 		}
 		// CompareAndDelete で TOCTOU を防ぐ: 自分が読んだエントリと同一の場合のみ削除。
 		assumeRoleCredsCache.CompareAndDelete(cacheKey, cached)
@@ -812,7 +836,9 @@ func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRole
 
 	roleARN := buildAssumeRoleARN(accountID, roleName)
 	// email が非空なら email を使用して CloudTrail の可読性を向上させる。cacheKey は sub ベースのまま。
-	sessionName := sanitizeSessionName("gw-ar-" + sessionIdentifier(email, sub))
+	// buildSessionName でプレフィックス分を除いた残り文字数で識別子を切り詰めるため、
+	// サフィックスが長い識別子によって消失しない。
+	sessionName := buildSessionName("gw-ar-", sessionIdentifier(email, sub), "")
 
 	// STS セッション期間はデフォルト（1 時間）を使用する。
 	// maxTTL はローカルキャッシュの退避 TTL であり STS セッション期間とは独立。
@@ -843,10 +869,12 @@ func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRole
 		creds: aws.NewCredentialsCache(evictingProvider, func(o *aws.CredentialsCacheOptions) {
 			o.ExpiryWindow = 5 * time.Minute
 		}),
-		createdAt: time.Now(),
+		createdAt:   time.Now(),
+		sessionName: sessionName,
 	}
 	actual, _ := assumeRoleCredsCache.LoadOrStore(cacheKey, newEntry)
-	return actual.(*assumeRoleCacheEntry).creds, nil
+	actualEntry := actual.(*assumeRoleCacheEntry)
+	return actualEntry.creds, actualEntry.sessionName, nil
 }
 
 // credentialsProviderFunc は関数を aws.CredentialsProvider として使えるようにするアダプタ。
@@ -1069,7 +1097,7 @@ func handleAssumeRoleRequest(
 		tokenFP = tokenFingerprint(user.IDToken)
 	}
 
-	creds, err := getAssumeRoleCredentials(r.Context(), stsClient, accountID, roleName, user.Subject, user.Email, cfg.externalID, cfg.maxCacheTTL, tokenFP)
+	creds, sessionName, err := getAssumeRoleCredentials(r.Context(), stsClient, accountID, roleName, user.Subject, user.Email, cfg.externalID, cfg.maxCacheTTL, tokenFP)
 	if err != nil {
 		slog.Error("getAssumeRoleCredentials failed",
 			"error", err.Error(),
@@ -1103,7 +1131,8 @@ func handleAssumeRoleRequest(
 	}
 
 	roleARN := buildAssumeRoleARN(accountID, roleName)
-	sessionName := sanitizeSessionName("gw-ar-" + sessionIdentifier(user.Email, user.Subject))
+	// sessionName は getAssumeRoleCredentials が返した実際の値を使用する。
+	// キャッシュヒット時でも作成時の sessionName を返すため、ログと CloudTrail が一致する。
 	slog.Info("assumerole request",
 		"account_id", accountID,
 		"role_name", roleName,
