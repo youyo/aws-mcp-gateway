@@ -202,8 +202,8 @@ func TestSplitCSV(t *testing.T) {
 		expected []string
 	}{
 		{"", nil},
-		{" ", nil},       // 空白のみ → nil（ALLOWED_DOMAINS=" " 設定ミスのケース）
-		{",", nil},       // カンマのみ → nil
+		{" ", nil}, // 空白のみ → nil（ALLOWED_DOMAINS=" " 設定ミスのケース）
+		{",", nil}, // カンマのみ → nil
 		{"example.com", []string{"example.com"}},
 		{"example.com,corp.example.com", []string{"example.com", "corp.example.com"}},
 		{" example.com , corp.example.com ", []string{"example.com", "corp.example.com"}}, // 前後空白のトリム
@@ -385,9 +385,9 @@ type stubAPIError struct {
 	code, msg string
 }
 
-func (e *stubAPIError) Error() string            { return e.msg }
-func (e *stubAPIError) ErrorCode() string        { return e.code }
-func (e *stubAPIError) ErrorMessage() string     { return e.msg }
+func (e *stubAPIError) Error() string                 { return e.msg }
+func (e *stubAPIError) ErrorCode() string             { return e.code }
+func (e *stubAPIError) ErrorMessage() string          { return e.msg }
 func (e *stubAPIError) ErrorFault() smithy.ErrorFault { return smithy.FaultClient }
 
 // TestClassifyFederatedError: classifyFederatedError の分類ロジックを確認
@@ -662,6 +662,7 @@ func TestGetFederatedRoundTripper_WithAssumeRole(t *testing.T) {
 		"arn:aws:iam::123456789012:role/FederatedRole",
 		"eyJhbGciOiJSUzI1NiJ9.test-id-token",
 		"test-sub",
+		"",
 		"arn:aws:iam::123456789012:role/TestRole",
 	)
 	// 認証情報がないためエラーが返ることもあるが、panic しないこと
@@ -684,9 +685,9 @@ func TestGetFederatedRoundTripper_CacheKeyIncludesAssumeRole(t *testing.T) {
 	// ARN-A と ARN-B で呼び出す → キャッシュに 2 エントリ入ること
 	// (実際の STS は呼ばないのでエラーになるが、panic しないこと)
 	getFederatedRoundTripper(ctx, "us-east-1", "aws-mcp",
-		"arn:aws:iam::111:role/Fed", "token1", "sub1", "arn:aws:iam::111:role/A")
+		"arn:aws:iam::111:role/Fed", "token1", "sub1", "", "arn:aws:iam::111:role/A")
 	getFederatedRoundTripper(ctx, "us-east-1", "aws-mcp",
-		"arn:aws:iam::111:role/Fed", "token1", "sub1", "arn:aws:iam::111:role/B")
+		"arn:aws:iam::111:role/Fed", "token1", "sub1", "", "arn:aws:iam::111:role/B")
 
 	count := 0
 	federatedCredsCache.Range(func(k, _ interface{}) bool { count++; return true })
@@ -704,7 +705,7 @@ func TestGetFederatedRoundTripper_NoAssumeRole(t *testing.T) {
 
 	ctx := context.Background()
 	getFederatedRoundTripper(ctx, "us-east-1", "aws-mcp",
-		"arn:aws:iam::111:role/Fed", "token1", "sub1", "")
+		"arn:aws:iam::111:role/Fed", "token1", "sub1", "", "")
 
 	found := false
 	federatedCredsCache.Range(func(k, _ interface{}) bool {
@@ -741,7 +742,7 @@ func TestGetFederatedRoundTripper_CacheHit_ReusesSameCredentials(t *testing.T) {
 	)
 
 	// 1 回目（cache miss → store）
-	_, _ = getFederatedRoundTripper(ctx, region, service, roleARN, idToken, sub, chained)
+	_, _ = getFederatedRoundTripper(ctx, region, service, roleARN, idToken, sub, "", chained)
 
 	cacheKey := sub + "::" + tokenFingerprint(idToken) + "::" + chained
 	v1, ok1 := federatedCredsCache.Load(cacheKey)
@@ -750,7 +751,7 @@ func TestGetFederatedRoundTripper_CacheHit_ReusesSameCredentials(t *testing.T) {
 	}
 
 	// 2 回目（cache hit → 同じエントリを返すべき）
-	_, _ = getFederatedRoundTripper(ctx, region, service, roleARN, idToken, sub, chained)
+	_, _ = getFederatedRoundTripper(ctx, region, service, roleARN, idToken, sub, "", chained)
 	v2, ok2 := federatedCredsCache.Load(cacheKey)
 	if !ok2 {
 		t.Fatal("2回目呼び出し後にキャッシュエントリがない")
@@ -902,7 +903,7 @@ func TestGetAssumeRoleCredentials_ExternalId(t *testing.T) {
 		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
 
 		client := &mockAssumeRoleClient{}
-		creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", "sub-extid", "my-external-id", 1*time.Hour, "")
+		creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", "sub-extid", "", "my-external-id", 1*time.Hour, "")
 		if err != nil {
 			t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
 		}
@@ -924,7 +925,7 @@ func TestGetAssumeRoleCredentials_ExternalId(t *testing.T) {
 		t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
 
 		client := &mockAssumeRoleClient{}
-		creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", "sub-noextid", "", 1*time.Hour, "")
+		creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", "sub-noextid", "", "", 1*time.Hour, "")
 		if err != nil {
 			t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
 		}
@@ -985,14 +986,18 @@ type mockAssumeRoleClient struct {
 	callCount int64
 	err       error
 	// 直近の AssumeRole 呼び出しで渡された ExternalId をキャプチャする（ExternalId 伝播テスト用）。
-	mu                 sync.Mutex
-	capturedExternalId *string
+	mu                  sync.Mutex
+	capturedExternalId  *string
+	capturedSessionName string
 }
 
 func (m *mockAssumeRoleClient) AssumeRole(ctx context.Context, params *sts.AssumeRoleInput, optFns ...func(*sts.Options)) (*sts.AssumeRoleOutput, error) {
 	atomic.AddInt64(&m.callCount, 1)
 	m.mu.Lock()
 	m.capturedExternalId = params.ExternalId
+	if params.RoleSessionName != nil {
+		m.capturedSessionName = *params.RoleSessionName
+	}
 	m.mu.Unlock()
 	if m.err != nil {
 		return nil, m.err
@@ -1033,7 +1038,7 @@ func TestGetAssumeRoleCredentials_SessionName(t *testing.T) {
 
 	longSub := strings.Repeat("a", 100)
 	client := &mockAssumeRoleClient{}
-	creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", longSub, "", 1*time.Hour, "")
+	creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", longSub, "", "", 1*time.Hour, "")
 	if err != nil {
 		t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
 	}
@@ -1064,11 +1069,11 @@ func TestGetAssumeRoleCredentials_CacheHit(t *testing.T) {
 	client := &mockAssumeRoleClient{}
 	ctx := context.Background()
 
-	creds1, err1 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", "", 1*time.Hour, "")
+	creds1, err1 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", "", "", 1*time.Hour, "")
 	if err1 != nil {
 		t.Fatalf("1回目 getAssumeRoleCredentials エラー: %v", err1)
 	}
-	creds2, err2 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", "", 1*time.Hour, "")
+	creds2, err2 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-test", "", "", 1*time.Hour, "")
 	if err2 != nil {
 		t.Fatalf("2回目 getAssumeRoleCredentials エラー: %v", err2)
 	}
@@ -1090,7 +1095,7 @@ func TestGetAssumeRoleCredentials_AccessDenied(t *testing.T) {
 	client := &mockAssumeRoleClient{err: accessDeniedErr}
 	ctx := context.Background()
 
-	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-denied", "", 1*time.Hour, "")
+	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-denied", "", "", 1*time.Hour, "")
 	if err != nil {
 		t.Fatalf("getAssumeRoleCredentials は AccessDenied をラップして返すはずだが直接エラー: %v", err)
 	}
@@ -1122,7 +1127,7 @@ func TestGetAssumeRoleCredentials_Throttling(t *testing.T) {
 	client := &mockAssumeRoleClient{err: throttleErr}
 	ctx := context.Background()
 
-	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-throttle", "", 1*time.Hour, "")
+	creds, err := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-throttle", "", "", 1*time.Hour, "")
 	if err != nil {
 		t.Fatalf("getAssumeRoleCredentials は Throttling をラップして返すはずだが直接エラー: %v", err)
 	}
@@ -1394,11 +1399,18 @@ func TestHandleAssumeRoleRequest(t *testing.T) {
 // mockFederatedSTS は AssumeRoleWithWebIdentity / AssumeRole を実装するテスト用モック。
 // TestHandleAssumeRoleRequest_Federated_* テストで newWebIdentitySTSClient / newChainedSTSClient 注入に使用する。
 type mockFederatedSTS struct {
-	webIdentityErr error
-	assumeRoleErr  error
+	webIdentityErr          error
+	assumeRoleErr           error
+	mu                      sync.Mutex
+	capturedWebIdentityName string
 }
 
 func (m *mockFederatedSTS) AssumeRoleWithWebIdentity(ctx context.Context, params *sts.AssumeRoleWithWebIdentityInput, optFns ...func(*sts.Options)) (*sts.AssumeRoleWithWebIdentityOutput, error) {
+	m.mu.Lock()
+	if params.RoleSessionName != nil {
+		m.capturedWebIdentityName = *params.RoleSessionName
+	}
+	m.mu.Unlock()
 	if m.webIdentityErr != nil {
 		return nil, m.webIdentityErr
 	}
@@ -1681,7 +1693,7 @@ func TestGetFederatedCreds_CacheHit(t *testing.T) {
 	)
 
 	// 1 回目（cache miss）
-	creds1, key1, err1 := getFederatedCreds(ctx, region, roleARN, idToken, sub, "")
+	creds1, key1, err1 := getFederatedCreds(ctx, region, roleARN, idToken, sub, "", "")
 	if err1 != nil {
 		t.Fatalf("1回目 getFederatedCreds エラー: %v", err1)
 	}
@@ -1690,7 +1702,7 @@ func TestGetFederatedCreds_CacheHit(t *testing.T) {
 	}
 
 	// 2 回目（cache hit）
-	creds2, key2, err2 := getFederatedCreds(ctx, region, roleARN, idToken, sub, "")
+	creds2, key2, err2 := getFederatedCreds(ctx, region, roleARN, idToken, sub, "", "")
 	if err2 != nil {
 		t.Fatalf("2回目 getFederatedCreds エラー: %v", err2)
 	}
@@ -1798,4 +1810,230 @@ func TestAssumeRoleEndpointRouting(t *testing.T) {
 		}
 		t.Logf("✓ /mcp へのリクエストは / ハンドラで処理された: status=%d", resp.StatusCode)
 	})
+}
+
+// TestSessionIdentifier は sessionIdentifier ヘルパーの単体テスト。
+// email が非空なら email を、空なら sub を返すことを確認する。
+func TestSessionIdentifier(t *testing.T) {
+	cases := []struct {
+		name  string
+		email string
+		sub   string
+		want  string
+	}{
+		{"email あり", "user@example.com", "sub-abc123", "user@example.com"},
+		{"email 空", "", "sub-abc123", "sub-abc123"},
+		{"email も sub も空", "", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sessionIdentifier(tc.email, tc.sub)
+			if got != tc.want {
+				t.Errorf("sessionIdentifier(%q, %q) = %q, want %q", tc.email, tc.sub, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGetAssumeRoleCredentials_SessionName_Email は email がある場合にセッション名が
+// "gw-ar-{email}" 形式になることを確認する。
+func TestGetAssumeRoleCredentials_SessionName_Email(t *testing.T) {
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+	client := &mockAssumeRoleClient{}
+	const email = "user@example.com"
+	const sub = "sub-test-email"
+	creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", sub, email, "", 1*time.Hour, "")
+	if err != nil {
+		t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
+	}
+	if creds == nil {
+		t.Fatal("creds が nil")
+	}
+
+	// Retrieve でセッション名を確定させる
+	if _, rerr := creds.Retrieve(context.Background()); rerr != nil {
+		t.Fatalf("Retrieve エラー: %v", rerr)
+	}
+
+	client.mu.Lock()
+	captured := client.capturedSessionName
+	client.mu.Unlock()
+
+	want := sanitizeSessionName("gw-ar-" + email)
+	if captured != want {
+		t.Errorf("RoleSessionName = %q, want %q (email ベース)", captured, want)
+	}
+	t.Logf("✓ email あり: RoleSessionName = %q", captured)
+}
+
+// TestGetAssumeRoleCredentials_SessionName_EmailFallback は email が空の場合に
+// セッション名が "gw-ar-{sub}" 形式にフォールバックすることを確認する。
+func TestGetAssumeRoleCredentials_SessionName_EmailFallback(t *testing.T) {
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+	client := &mockAssumeRoleClient{}
+	const sub = "sub-test-fallback"
+	creds, err := getAssumeRoleCredentials(context.Background(), client, "123456789012", "AwsMcpGatewayRole", sub, "", "", 1*time.Hour, "")
+	if err != nil {
+		t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
+	}
+	if creds == nil {
+		t.Fatal("creds が nil")
+	}
+
+	if _, rerr := creds.Retrieve(context.Background()); rerr != nil {
+		t.Fatalf("Retrieve エラー: %v", rerr)
+	}
+
+	client.mu.Lock()
+	captured := client.capturedSessionName
+	client.mu.Unlock()
+
+	want := sanitizeSessionName("gw-ar-" + sub)
+	if captured != want {
+		t.Errorf("RoleSessionName = %q, want %q (sub フォールバック)", captured, want)
+	}
+	t.Logf("✓ email 空: RoleSessionName = %q (sub フォールバック)", captured)
+}
+
+// TestGetFederatedCreds_SessionName_Email は email がある場合に WebIdentity セッション名が
+// "gw-{email}" 形式になることを確認する。
+func TestGetFederatedCreds_SessionName_Email(t *testing.T) {
+	federatedCredsCache = sync.Map{}
+	t.Cleanup(func() { federatedCredsCache = sync.Map{} })
+
+	mockSTS := &mockFederatedSTS{}
+	origNewWebIdentitySTSClient := newWebIdentitySTSClient
+	t.Cleanup(func() { newWebIdentitySTSClient = origNewWebIdentitySTSClient })
+	newWebIdentitySTSClient = func(ctx context.Context, region string) (stscreds.AssumeRoleWithWebIdentityAPIClient, error) {
+		return mockSTS, nil
+	}
+
+	const email = "user@example.com"
+	const sub = "sub-federated-email"
+	const idToken = "test-id-token-email"
+	ctx := context.Background()
+
+	creds, _, err := getFederatedCreds(ctx, "us-east-1", "arn:aws:iam::123:role/Fed", idToken, sub, email, "")
+	if err != nil {
+		t.Fatalf("getFederatedCreds エラー: %v", err)
+	}
+	if _, rerr := creds.Retrieve(ctx); rerr != nil {
+		t.Fatalf("Retrieve エラー: %v", rerr)
+	}
+
+	mockSTS.mu.Lock()
+	captured := mockSTS.capturedWebIdentityName
+	mockSTS.mu.Unlock()
+
+	want := sanitizeSessionName("gw-" + email)
+	if captured != want {
+		t.Errorf("WebIdentity RoleSessionName = %q, want %q (email ベース)", captured, want)
+	}
+	t.Logf("✓ email あり: WebIdentity RoleSessionName = %q", captured)
+}
+
+// TestGetFederatedCreds_SessionName_EmailFallback は email が空の場合に WebIdentity セッション名が
+// "gw-{sub}" 形式にフォールバックすることを確認する。
+func TestGetFederatedCreds_SessionName_EmailFallback(t *testing.T) {
+	federatedCredsCache = sync.Map{}
+	t.Cleanup(func() { federatedCredsCache = sync.Map{} })
+
+	mockSTS := &mockFederatedSTS{}
+	origNewWebIdentitySTSClient := newWebIdentitySTSClient
+	t.Cleanup(func() { newWebIdentitySTSClient = origNewWebIdentitySTSClient })
+	newWebIdentitySTSClient = func(ctx context.Context, region string) (stscreds.AssumeRoleWithWebIdentityAPIClient, error) {
+		return mockSTS, nil
+	}
+
+	const sub = "sub-federated-fallback"
+	const idToken = "test-id-token-fallback"
+	ctx := context.Background()
+
+	creds, _, err := getFederatedCreds(ctx, "us-east-1", "arn:aws:iam::123:role/Fed", idToken, sub, "", "")
+	if err != nil {
+		t.Fatalf("getFederatedCreds エラー: %v", err)
+	}
+	if _, rerr := creds.Retrieve(ctx); rerr != nil {
+		t.Fatalf("Retrieve エラー: %v", rerr)
+	}
+
+	mockSTS.mu.Lock()
+	captured := mockSTS.capturedWebIdentityName
+	mockSTS.mu.Unlock()
+
+	want := sanitizeSessionName("gw-" + sub)
+	if captured != want {
+		t.Errorf("WebIdentity RoleSessionName = %q, want %q (sub フォールバック)", captured, want)
+	}
+	t.Logf("✓ email 空: WebIdentity RoleSessionName = %q (sub フォールバック)", captured)
+}
+
+// TestGetFederatedCreds_CacheKey_EmailDoesNotAffectKey は、同一 sub + 同一 idToken で
+// email が異なる場合でも同一キャッシュエントリを返すことを確認する。
+// email は session name にのみ影響し、cacheKey に混入しないことを保証する。
+func TestGetFederatedCreds_CacheKey_EmailDoesNotAffectKey(t *testing.T) {
+	federatedCredsCache = sync.Map{}
+	t.Cleanup(func() { federatedCredsCache = sync.Map{} })
+
+	mockSTS := &mockFederatedSTS{}
+	origNewWebIdentitySTSClient := newWebIdentitySTSClient
+	t.Cleanup(func() { newWebIdentitySTSClient = origNewWebIdentitySTSClient })
+	newWebIdentitySTSClient = func(ctx context.Context, region string) (stscreds.AssumeRoleWithWebIdentityAPIClient, error) {
+		return mockSTS, nil
+	}
+
+	const sub = "sub-cache-email-test"
+	const idToken = "test-token-for-cache"
+	ctx := context.Background()
+
+	// email A で呼び出し（cache miss）
+	creds1, key1, err1 := getFederatedCreds(ctx, "us-east-1", "arn:aws:iam::123:role/Fed", idToken, sub, "emailA@example.com", "")
+	if err1 != nil {
+		t.Fatalf("1回目（email A）getFederatedCreds エラー: %v", err1)
+	}
+
+	// 異なる email B で呼び出し（cacheKey は sub ベースなので同一エントリにヒットするべき）
+	creds2, key2, err2 := getFederatedCreds(ctx, "us-east-1", "arn:aws:iam::123:role/Fed", idToken, sub, "emailB@example.com", "")
+	if err2 != nil {
+		t.Fatalf("2回目（email B）getFederatedCreds エラー: %v", err2)
+	}
+
+	if key1 != key2 {
+		t.Errorf("email が異なると cacheKey が変わった: key1=%q key2=%q (email を cacheKey に混ぜてはならない)", key1, key2)
+	}
+	if creds1 != creds2 {
+		t.Errorf("email が異なると別の CredentialsCache が返った: creds1=%p creds2=%p (同一エントリを返すべき)", creds1, creds2)
+	}
+	t.Logf("✓ email が異なっても cacheKey は同一: key=%q, ptr=%p", key1, creds1)
+}
+
+// TestGetAssumeRoleCredentials_CacheKey_EmailDoesNotAffectKey は、同一 sub で
+// email が異なる場合でも同一キャッシュエントリを返すことを確認する。
+func TestGetAssumeRoleCredentials_CacheKey_EmailDoesNotAffectKey(t *testing.T) {
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+	client := &mockAssumeRoleClient{}
+	ctx := context.Background()
+
+	// email A で呼び出し（cache miss）
+	creds1, err1 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-emailkey", "emailA@example.com", "", 1*time.Hour, "")
+	if err1 != nil {
+		t.Fatalf("1回目（email A）getAssumeRoleCredentials エラー: %v", err1)
+	}
+
+	// 異なる email B で呼び出し（cacheKey は sub ベースなので同一エントリにヒットするべき）
+	creds2, err2 := getAssumeRoleCredentials(ctx, client, "123456789012", "AwsMcpGatewayRole", "sub-emailkey", "emailB@example.com", "", 1*time.Hour, "")
+	if err2 != nil {
+		t.Fatalf("2回目（email B）getAssumeRoleCredentials エラー: %v", err2)
+	}
+
+	if creds1 != creds2 {
+		t.Errorf("email が異なると別の CredentialsCache が返った: creds1=%p creds2=%p (同一エントリを返すべき)", creds1, creds2)
+	}
+	t.Logf("✓ email が異なっても同一 CredentialsCache が返った: ptr=%p", creds1)
 }
