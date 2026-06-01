@@ -52,6 +52,7 @@ AWS 認証情報は環境から自動解決されます（Lambda 実行ロール
 | `ALLOWED_DOMAINS` | 許可するメールドメイン（カンマ区切り、例: `example.com,corp.example.com`）。未設定の場合は OIDC テナント内の全ユーザーが認証可能 — ログに警告が出るがゲートウェイは起動する。大文字小文字を区別しない。注意: 許可リストはログイン時のみチェックされる。許可リストを変更しても既発行のトークンは有効期限まで有効。 | none |
 | `ALLOWED_EMAILS` | 許可するメールアドレス（カンマ区切り）。`ALLOWED_DOMAINS` と OR 条件。大文字小文字を区別しない。 | none |
 | `COOKIE_SECRET` | Cookie 暗号化キー（hex エンコード、32 バイト以上） | ランダム生成（再起動でセッション消失） |
+| `SIGNING_KEY_HEX` | OAuth 2.1 JWT 署名鍵（PKCS8 DER の hex エンコード）。**Lambda 並行実行・ECS 複数タスクなどのマルチインスタンス環境では必須**。未設定時は ephemeral 鍵を生成し警告を出力。生成: `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -outform DER -out signing.key && xxd -p -c 0 signing.key` | ランダム生成（インスタンス間でトークン検証が断続的に失敗） |
 | `AWS_MCP_ENDPOINT` | AWS MCP Server エンドポイント URL（`AWS_MCP_REGION` より優先） | `AWS_MCP_REGION` から導出 |
 | `AWS_MCP_REGION` | AWS MCP Server エンドポイントのリージョン | `us-east-1` |
 | `TARGET_AWS_REGION` | AWS API 操作のデフォルトリージョン | `ap-northeast-1` |
@@ -632,6 +633,7 @@ export OIDC_ISSUER=https://login.microsoftonline.com/{tenant-id}/v2.0
 export OIDC_CLIENT_ID=your-client-id
 export OIDC_CLIENT_SECRET=your-client-secret
 export COOKIE_SECRET=$(openssl rand -hex 32)
+export SIGNING_KEY_HEX=$(openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -outform DER 2>/dev/null | xxd -p -c 0)
 
 aws-mcp-gateway
 ```

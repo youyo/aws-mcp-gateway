@@ -21,6 +21,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -53,6 +54,11 @@ const (
 	defaultListenPort      = "8080"
 	defaultTargetAWSRegion = "ap-northeast-1"
 	defaultMCPRegion       = "us-east-1"
+
+	// maxRequestBodyBytes は受け入れるリクエストボディの最大サイズ。
+	// Lambda Function URL のペイロード上限（6 MiB）に合わせて設定し、
+	// ECS/EC2 等の長時間稼働環境でのメモリ DoS を防ぐ多層防御。
+	maxRequestBodyBytes = 6 * 1024 * 1024 // 6 MiB
 )
 
 // sigV4RoundTripper signs outbound HTTP requests with AWS SigV4.
@@ -568,6 +574,42 @@ func handleFederatedRequest(w http.ResponseWriter, r *http.Request, user *idprox
 	buildProxy(cfg.target, federatedTransport).ServeHTTP(w, r)
 }
 
+// loadSigningKey は SIGNING_KEY_HEX 環境変数から ECDSA P-256 秘密鍵をロードする。
+// COOKIE_SECRET と同じパターン: 設定済みなら使用し、未設定なら ephemeral 鍵を生成して警告を出す。
+//
+// マルチインスタンス（Lambda 並行実行・ECS 複数タスク）では全インスタンスで同一の鍵を
+// 共有する必要がある。idproxy はトークン検証にローカル署名検証を使用するため、
+// インスタンス A が発行した JWT をインスタンス B が検証できなくなる。
+//
+// SIGNING_KEY_HEX の生成手順（PKCS8 DER を hex エンコード）:
+//
+//	openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -outform DER -out signing.key
+//	xxd -p -c 0 signing.key
+func loadSigningKey() (*ecdsa.PrivateKey, error) {
+	keyHex := strings.TrimSpace(os.Getenv("SIGNING_KEY_HEX"))
+	if keyHex != "" {
+		keyDER, err := hex.DecodeString(keyHex)
+		if err != nil {
+			return nil, fmt.Errorf("invalid SIGNING_KEY_HEX: must be hex-encoded PKCS8 DER: %w", err)
+		}
+		parsed, err := x509.ParsePKCS8PrivateKey(keyDER)
+		if err != nil {
+			return nil, fmt.Errorf("invalid SIGNING_KEY_HEX: failed to parse PKCS8: %w", err)
+		}
+		ecKey, ok := parsed.(*ecdsa.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("invalid SIGNING_KEY_HEX: key type %T is not ECDSA", parsed)
+		}
+		if ecKey.Curve != elliptic.P256() {
+			return nil, fmt.Errorf("invalid SIGNING_KEY_HEX: key must be ECDSA P-256 (got %s), required for ES256 JWT signing", ecKey.Curve.Params().Name)
+		}
+		slog.Info("using ECDSA signing key from SIGNING_KEY_HEX")
+		return ecKey, nil
+	}
+	slog.Warn("SIGNING_KEY_HEX not set, using ephemeral signing key — tokens will be invalid across restarts and multiple instances")
+	return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+}
+
 func mustEnv(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
@@ -643,10 +685,13 @@ func main() {
 	}
 	proxy := buildProxy(target, transport)
 
-	// ECDSA signing key for OAuth 2.1 JWT (ephemeral; use a persisted key in production)
-	signingKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	// ECDSA signing key for OAuth 2.1 JWT.
+	// Set SIGNING_KEY_HEX (hex-encoded PKCS8 DER) for stable multi-instance deployments.
+	// Without it, an ephemeral key is generated per process restart, which invalidates
+	// tokens across Lambda concurrent executions and restarts.
+	signingKey, err := loadSigningKey()
 	if err != nil {
-		slog.Error("failed to generate ECDSA signing key", "error", err.Error())
+		slog.Error("failed to load ECDSA signing key", "error", err.Error())
 		os.Exit(1)
 	}
 
@@ -736,6 +781,9 @@ func main() {
 	// Log OIDC user identity on every authenticated request for audit traceability.
 	// This enables correlating gateway access logs (who) with CloudTrail (what AWS actions).
 	loggingProxy := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil && r.Body != http.NoBody {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		}
 		user := idproxy.UserFromContext(r.Context())
 		if user != nil {
 			slog.Info("request",
@@ -832,6 +880,20 @@ func getAssumeRoleCredentials(ctx context.Context, stsClient stscreds.AssumeRole
 		}
 		// CompareAndDelete で TOCTOU を防ぐ: 自分が読んだエントリと同一の場合のみ削除。
 		assumeRoleCredsCache.CompareAndDelete(cacheKey, cached)
+	}
+
+	// cache miss: federated モード（tokenFP != ""）で同一 accountID+roleName+sub の
+	// 古い tokenFP エントリを削除する（メモリリーク防止）。
+	// IDToken ローテーション時に tokenFP が変わり古いエントリが二度と参照されなくなるため。
+	// federatedCredsCache の同様のロジック（Range による古い fingerprint のパージ）と対称的な実装。
+	if tokenFP != "" {
+		baseKey := accountID + "::" + roleName + "::" + sub + "::"
+		assumeRoleCredsCache.Range(func(k, _ interface{}) bool {
+			if ks, ok := k.(string); ok && strings.HasPrefix(ks, baseKey) && ks != cacheKey {
+				assumeRoleCredsCache.Delete(ks)
+			}
+			return true
+		})
 	}
 
 	roleARN := buildAssumeRoleARN(accountID, roleName)
@@ -997,6 +1059,9 @@ func handleAssumeRoleRequest(
 	iamMode string,
 	federatedRoleARN string,
 ) {
+	if r.Body != nil && r.Body != http.NoBody {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	}
 	accountID := r.PathValue("account_id")
 	roleName := r.PathValue("role_name")
 

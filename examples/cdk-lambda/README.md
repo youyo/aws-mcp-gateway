@@ -92,6 +92,12 @@ aws ssm put-parameter --region $REGION --type String \
   --name /${INSTANCE_NAME}/COOKIE_SECRET \
   --value "$(openssl rand -hex 32)"
 
+# OAuth 2.1 JWT 署名鍵 — Lambda 並行実行（複数インスタンス）では全インスタンスで同一値が必要
+# COOKIE_SECRET と同様に一度生成したら変更しないこと（変更するとセッションが無効になる）
+aws ssm put-parameter --region $REGION --type String \
+  --name /${INSTANCE_NAME}/SIGNING_KEY_HEX \
+  --value "$(openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -outform DER 2>/dev/null | xxd -p -c 0)"
+
 aws ssm put-parameter --region $REGION --type String \
   --name /${INSTANCE_NAME}/DYNAMODB_TABLE \
   --value "${INSTANCE_NAME}"
