@@ -2,6 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -2165,3 +2170,205 @@ func TestGetAssumeRoleCredentials_ReturnsSessionName(t *testing.T) {
 	}
 	t.Logf("✓ キャッシュヒット: sessionName=%q (固着確認)", sessionName2)
 }
+
+// --- 新規テスト: loadSigningKey, body size limit, cache sweep ---
+
+// TestLoadSigningKey_FromEnv は SIGNING_KEY_HEX が設定されている場合に
+// その鍵が正しくロードされることを確認する。
+func TestLoadSigningKey_FromEnv(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("テスト用鍵生成失敗: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("PKCS8 マーシャル失敗: %v", err)
+	}
+	t.Setenv("SIGNING_KEY_HEX", hex.EncodeToString(der))
+
+	got, err := loadSigningKey()
+	if err != nil {
+		t.Fatalf("loadSigningKey エラー: %v", err)
+	}
+	if !got.PublicKey.Equal(&key.PublicKey) {
+		t.Error("ロードした鍵が期待値と一致しない")
+	}
+	t.Logf("✓ SIGNING_KEY_HEX から正しく ECDSA P-256 鍵がロードされた")
+}
+
+// TestLoadSigningKey_Ephemeral は SIGNING_KEY_HEX 未設定時に ephemeral 鍵が
+// 生成されること（呼び出しごとに異なる鍵になること）を確認する。
+func TestLoadSigningKey_Ephemeral(t *testing.T) {
+	t.Setenv("SIGNING_KEY_HEX", "")
+
+	got1, err1 := loadSigningKey()
+	if err1 != nil {
+		t.Fatalf("1回目 loadSigningKey エラー: %v", err1)
+	}
+	got2, err2 := loadSigningKey()
+	if err2 != nil {
+		t.Fatalf("2回目 loadSigningKey エラー: %v", err2)
+	}
+	if got1.PublicKey.Equal(&got2.PublicKey) {
+		t.Error("ephemeral 鍵は呼び出しごとに異なるはず")
+	}
+	t.Logf("✓ ephemeral 鍵が呼び出しごとに異なる鍵を生成した")
+}
+
+// TestLoadSigningKey_InvalidHex は SIGNING_KEY_HEX に不正な hex 文字列が
+// 設定された場合にエラーを返すことを確認する。
+func TestLoadSigningKey_InvalidHex(t *testing.T) {
+	t.Setenv("SIGNING_KEY_HEX", "not-valid-hex!!")
+
+	_, err := loadSigningKey()
+	if err == nil {
+		t.Error("不正な hex に対してエラーが返るべき")
+	}
+	t.Logf("✓ 不正な hex に対してエラーを返した: %v", err)
+}
+
+// TestLoadSigningKey_WrongKeyType は SIGNING_KEY_HEX に P-256 以外の鍵（P-384）が
+// 設定された場合にエラーを返すことを確認する。
+// idproxy は ES256（ECDSA P-256）を要求するため、P-256 以外は起動時に reject する。
+func TestLoadSigningKey_WrongKeyType(t *testing.T) {
+	key384, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatalf("P384 鍵生成失敗: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key384)
+	if err != nil {
+		t.Fatalf("PKCS8 マーシャル失敗: %v", err)
+	}
+	t.Setenv("SIGNING_KEY_HEX", hex.EncodeToString(der))
+
+	_, err = loadSigningKey()
+	if err == nil {
+		t.Error("P-256 以外の鍵に対してエラーが返るべき（idproxy は ES256=P-256 を要求）")
+		return
+	}
+	t.Logf("✓ P-384 鍵に対してエラーを返した: %v", err)
+}
+
+// TestGetAssumeRoleCredentials_OldTokenFPEvicted は federated モードで
+// tokenFP が変わったとき（IDToken ローテーション後）に古いキャッシュエントリが
+// evict されることを確認する。
+// federatedCredsCache の Range sweep（211-216行）と対称的な動作を検証する。
+func TestGetAssumeRoleCredentials_OldTokenFPEvicted(t *testing.T) {
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+	const accountID = "111111111111"
+	const roleName = "TestRole"
+	const sub = "sub-fp-evict"
+	const oldFP = "oldfp01"
+	const newFP = "newfp02"
+
+	// 古い tokenFP のエントリを手動で登録
+	oldKey := accountID + "::" + roleName + "::" + sub + "::" + oldFP
+	dummyCreds := aws.NewCredentialsCache(aws.AnonymousCredentials{})
+	oldEntry := &assumeRoleCacheEntry{
+		creds:       dummyCreds,
+		createdAt:   time.Now(),
+		sessionName: "gw-ar-old",
+	}
+	assumeRoleCredsCache.Store(oldKey, oldEntry)
+
+	// 新しい tokenFP で getAssumeRoleCredentials を呼び出す（キャッシュミス）
+	client := &mockAssumeRoleClient{}
+	_, _, err := getAssumeRoleCredentials(context.Background(), client, accountID, roleName, sub, "", "", 55*time.Minute, newFP)
+	if err != nil {
+		t.Fatalf("getAssumeRoleCredentials エラー: %v", err)
+	}
+
+	// 古い tokenFP のエントリが evict されていることを確認
+	if _, ok := assumeRoleCredsCache.Load(oldKey); ok {
+		t.Errorf("古い tokenFP のキャッシュエントリが残っている（evict されるべき）: key=%q", oldKey)
+	} else {
+		t.Logf("✓ 古い tokenFP のキャッシュエントリが evict された: key=%q", oldKey)
+	}
+
+	// 新しい tokenFP のエントリが存在することを確認
+	newKey := accountID + "::" + roleName + "::" + sub + "::" + newFP
+	if _, ok := assumeRoleCredsCache.Load(newKey); !ok {
+		t.Errorf("新しい tokenFP のキャッシュエントリが存在しない: key=%q", newKey)
+	} else {
+		t.Logf("✓ 新しい tokenFP のキャッシュエントリが作成された: key=%q", newKey)
+	}
+}
+
+// TestHandleAssumeRoleRequest_OversizedBody は maxRequestBodyBytes を超えるボディが
+// handleAssumeRoleRequest で 400 を返すことを確認する（MaxBytesReader の実動作検証）。
+// STS モックで AssumeRole を成功させ、injectMetaAWSRegion のボディ読み取りまで到達させる。
+func TestHandleAssumeRoleRequest_OversizedBody(t *testing.T) {
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() { assumeRoleCredsCache = sync.Map{} })
+
+	const allowedAccount = "123456789012"
+	const allowedRole = "BodyLimitRole"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	target, _ := url.Parse(upstream.URL)
+
+	cfg := assumeRoleConfig{
+		allowedAccounts:  []string{allowedAccount},
+		allowedRoleNames: []string{allowedRole},
+		maxCacheTTL:      1 * time.Hour,
+	}
+	user := &idproxy.User{Subject: "sub-bodylimit", Email: "limit@example.com"}
+	stsClient := &mockSTSClientM5{}
+
+	// maxRequestBodyBytes を超える大きなボディ（neverEndingReader で 6MiB+1 バイト送信）
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost,
+		"/mcp/assumerole/accounts/"+allowedAccount+"/rolename/"+allowedRole,
+		io.LimitReader(neverEndingByteReader{}, int64(maxRequestBodyBytes)+1),
+	)
+	req.ContentLength = int64(maxRequestBodyBytes) + 1
+	req.SetPathValue("account_id", allowedAccount)
+	req.SetPathValue("role_name", allowedRole)
+
+	handleAssumeRoleRequest(rec, req, user, cfg, target, stsClient, "us-east-1", "ap-northeast-1", "shared", "")
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("oversized body: 期待値 400、実際: %d body=%q", rec.Code, strings.TrimSpace(rec.Body.String()))
+	} else {
+		t.Logf("✓ oversized body（>%d bytes）に対して 400 を返した", maxRequestBodyBytes)
+	}
+}
+
+// neverEndingByteReader は 'x' バイトを無限に返す io.Reader（メモリ節約のためのヘルパー）。
+// io.LimitReader と組み合わせて指定バイト数のボディをシミュレートする。
+type neverEndingByteReader struct{}
+
+func (neverEndingByteReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
+}
+
+// TestInjectMetaAWSRegion_ReadErrorReturnsFalse はボディ読み取りエラー（MaxBytesReader 超過など）
+// 発生時に injectMetaAWSRegion が ok=false を返すことを確認する。
+// これは MaxBytesReader が handler で適用された場合の error path の動作保証テスト。
+func TestInjectMetaAWSRegion_ReadErrorReturnsFalse(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/mcp", errorBodyReader{})
+	req.ContentLength = 1 // 0 以外にして早期リターンを回避
+
+	_, ok := injectMetaAWSRegion(req, "us-east-1")
+	if ok {
+		t.Error("ボディ読み取りエラー時は ok=false を返すべき")
+	}
+	t.Logf("✓ ボディ読み取りエラー時に ok=false を返した")
+}
+
+// errorBodyReader は Read 時に必ずエラーを返す io.ReadCloser（MaxBytesReader 超過のシミュレーション）。
+type errorBodyReader struct{}
+
+func (errorBodyReader) Read([]byte) (int, error) {
+	return 0, errors.New("simulated body read error")
+}
+func (errorBodyReader) Close() error { return nil }
