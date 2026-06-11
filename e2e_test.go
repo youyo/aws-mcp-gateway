@@ -1057,8 +1057,8 @@ func TestGetAssumeRoleCredentials_SessionName(t *testing.T) {
 		t.Fatalf("Retrieve エラー: %v", rerr)
 	}
 
-	// RoleSessionName が 64 文字以内か確認するため、sanitizeSessionName の結果を直接確認
-	sessionName := sanitizeSessionName("gw-ar-" + longSub)
+	// RoleSessionName が 64 文字以内か確認するため、buildSessionName の結果を確認
+	sessionName := buildSessionName("gw-ar-", longSub, "")
 	if len(sessionName) > 64 {
 		t.Errorf("セッション名が 64 文字を超えている: len=%d", len(sessionName))
 	}
@@ -2428,3 +2428,112 @@ func (errorBodyReader) Read([]byte) (int, error) {
 	return 0, errors.New("simulated body read error")
 }
 func (errorBodyReader) Close() error { return nil }
+
+// --- Red テスト (3件) ---
+
+// TestTokenFingerprint_Returns16HexChars は tokenFingerprint が 16 文字の hex を返すことを確認する。
+// 変更前: h[:4] = 8 文字。変更後: h[:8] = 16 文字（衝突空間 2^32 → 2^64）。
+func TestTokenFingerprint_Returns16HexChars(t *testing.T) {
+	fp := tokenFingerprint("any-token")
+	if len(fp) != 16 {
+		t.Errorf("tokenFingerprint の長さ want 16, got %d (%q)", len(fp), fp)
+	}
+	for _, c := range fp {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			t.Errorf("tokenFingerprint に非 hex 文字が含まれる: %q", fp)
+			break
+		}
+	}
+	t.Logf("✓ tokenFingerprint = %q (len=%d)", fp, len(fp))
+}
+
+// TestTokenFingerprint_DifferentTokensDifferentFingerprints は異なるトークンが異なる指紋を返すことを確認する。
+func TestTokenFingerprint_DifferentTokensDifferentFingerprints(t *testing.T) {
+	fp1 := tokenFingerprint("token-A")
+	fp2 := tokenFingerprint("token-B")
+	if fp1 == fp2 {
+		t.Errorf("異なるトークンが同一の指紋を返した: %q", fp1)
+	}
+	t.Logf("✓ token-A=%q  token-B=%q", fp1, fp2)
+}
+
+// TestSanitizeSessionName_NoTruncation は sanitizeSessionName が長さ制限を行わないことを確認する。
+// 長さ制限の責務は buildSessionName に集約する（単一責任原則）。
+func TestSanitizeSessionName_NoTruncation(t *testing.T) {
+	longInput := strings.Repeat("a", 80)
+	got := sanitizeSessionName(longInput)
+	if len(got) < 80 {
+		t.Errorf("sanitizeSessionName が 80 文字入力を %d 文字にトランケートした（トランケートすべきでない）", len(got))
+	}
+	t.Logf("✓ sanitizeSessionName(80文字) → len=%d (トランケートなし)", len(got))
+}
+
+// TestRoundTrip_SmallBodyPassesThrough は sigV4RoundTripper.RoundTrip が
+// 上限未満のボディを変更せず上流に転送することを確認する。
+func TestRoundTrip_SmallBodyPassesThrough(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	var receivedBody []byte
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer mock.Close()
+
+	transport, err := newSigV4RoundTripper(context.Background(), "us-east-1", awsMCPService)
+	if err != nil {
+		t.Fatalf("RoundTripper 作成失敗: %v", err)
+	}
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"ping"}`
+	req, _ := http.NewRequest(http.MethodPost, mock.URL, strings.NewReader(body))
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip エラー: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if string(receivedBody) != body {
+		t.Errorf("受信ボディが変更された: want %q, got %q", body, receivedBody)
+	}
+	t.Logf("✓ 上限未満のボディ (%d bytes) は変更なく転送された", len(body))
+}
+
+// TestRoundTrip_OversizedBodyRejected は sigV4RoundTripper.RoundTrip が
+// maxRequestBodyBytes を超えるボディをサイレント切り詰めせず、エラーで拒否することを確認する。
+// 切り詰めたボディに SigV4 署名して転送すると、呼び出し元の意図と異なるペイロードが
+// 正規署名付きで上流に届いてしまうため、明示的な拒否が必須。
+func TestRoundTrip_OversizedBodyRejected(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	upstreamCalled := false
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer mock.Close()
+
+	transport, err := newSigV4RoundTripper(context.Background(), "us-east-1", awsMCPService)
+	if err != nil {
+		t.Fatalf("RoundTripper 作成失敗: %v", err)
+	}
+
+	oversized := strings.Repeat("a", maxRequestBodyBytes+1)
+	req, _ := http.NewRequest(http.MethodPost, mock.URL, strings.NewReader(oversized))
+	_, err = transport.RoundTrip(req)
+	if err == nil {
+		t.Fatal("上限超過ボディがエラーにならなかった（サイレント切り詰めの疑い）")
+	}
+	if upstreamCalled {
+		t.Error("上限超過ボディが上流に転送された")
+	}
+	t.Logf("✓ 上限超過ボディが拒否された: %v", err)
+}

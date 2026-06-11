@@ -103,9 +103,16 @@ func (t *sigV4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	var bodyBytes []byte
 	if req.Body != nil {
 		var err error
-		bodyBytes, err = io.ReadAll(req.Body)
+		// Second line of defence (the handler layer applies MaxBytesReader):
+		// read up to limit+1 to detect oversized bodies and reject them explicitly.
+		// Silent truncation is not acceptable — the proxy would SigV4-sign and
+		// forward a payload different from what the caller sent.
+		bodyBytes, err = io.ReadAll(io.LimitReader(req.Body, maxRequestBodyBytes+1))
 		if err != nil {
 			return nil, fmt.Errorf("failed to read request body: %w", err)
+		}
+		if len(bodyBytes) > maxRequestBodyBytes {
+			return nil, fmt.Errorf("request body exceeds %d bytes limit", maxRequestBodyBytes)
 		}
 		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
@@ -148,7 +155,7 @@ var sigV4HTTPTransport = func() *http.Transport {
 }()
 
 // federatedCredsCache はユーザーごとの CredentialsCache をキャッシュする。
-// キー: "sub::tokenFingerprint"（8桁の sha256 hex）
+// キー: "sub::tokenFingerprint"（16桁の sha256 hex）
 // 同一トークンに対してリクエストごとに STS を呼ぶことを防ぐ。
 var federatedCredsCache sync.Map
 
@@ -158,11 +165,12 @@ func evictFederatedEntry(cacheKey string) {
 	federatedCredsCache.Delete(cacheKey)
 }
 
-// tokenFingerprint は ID Token の sha256 上位 4 バイトを hex 文字列で返す。
+// tokenFingerprint は ID Token の sha256 上位 8 バイトを hex 文字列で返す。
 // キャッシュキーのトークン同一性チェックに使用する（全文保持を避ける）。
+// 8 バイト（16 hex 文字）で衝突空間 2^64 を確保する。
 func tokenFingerprint(idToken string) string {
 	h := sha256.Sum256([]byte(idToken))
-	return hex.EncodeToString(h[:4])
+	return hex.EncodeToString(h[:8])
 }
 
 // newWebIdentitySTSClient は WebIdentityRoleProvider に渡す STS クライアントを生成する。
@@ -339,8 +347,9 @@ func sessionIdentifier(email, sub string) string {
 	return sub
 }
 
-// sanitizeSessionName removes characters not allowed in STS RoleSessionName and truncates to 64 chars.
+// sanitizeSessionName removes characters not allowed in STS RoleSessionName.
 // STS allows [\w+=,.@-]+ which includes '+'.
+// Length truncation is the caller's responsibility (buildSessionName handles it).
 func sanitizeSessionName(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -349,11 +358,7 @@ func sanitizeSessionName(s string) string {
 			b.WriteRune(r)
 		}
 	}
-	name := b.String()
-	if len(name) > 64 {
-		name = name[:64]
-	}
-	return name
+	return b.String()
 }
 
 // buildSessionName は prefix + sanitize(id) + suffix を組み立て、合計 64 文字以内に収める。
