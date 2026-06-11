@@ -2468,17 +2468,72 @@ func TestSanitizeSessionName_NoTruncation(t *testing.T) {
 	t.Logf("✓ sanitizeSessionName(80文字) → len=%d (トランケートなし)", len(got))
 }
 
-// TestLimitReader_PreservesSmallBody は io.LimitReader が 6MiB 未満のボディを
-// 切り詰めないことを確認する（sigV4RoundTripper での LimitReader 追加による回帰テスト）。
-func TestLimitReader_PreservesSmallBody(t *testing.T) {
-	body := `{"jsonrpc":"2.0","id":1,"method":"ping"}`
-	limited := io.LimitReader(strings.NewReader(body), 6<<20)
-	got, err := io.ReadAll(limited)
+// TestRoundTrip_SmallBodyPassesThrough は sigV4RoundTripper.RoundTrip が
+// 上限未満のボディを変更せず上流に転送することを確認する。
+func TestRoundTrip_SmallBodyPassesThrough(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	var receivedBody []byte
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer mock.Close()
+
+	transport, err := newSigV4RoundTripper(context.Background(), "us-east-1", awsMCPService)
 	if err != nil {
-		t.Fatalf("io.ReadAll エラー: %v", err)
+		t.Fatalf("RoundTripper 作成失敗: %v", err)
 	}
-	if string(got) != body {
-		t.Errorf("ボディが変更された: want %q, got %q", body, got)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"ping"}`
+	req, _ := http.NewRequest(http.MethodPost, mock.URL, strings.NewReader(body))
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip エラー: %v", err)
 	}
-	t.Logf("✓ 6MiB未満のボディは LimitReader で変更なし (%d bytes)", len(body))
+	defer resp.Body.Close()
+
+	if string(receivedBody) != body {
+		t.Errorf("受信ボディが変更された: want %q, got %q", body, receivedBody)
+	}
+	t.Logf("✓ 上限未満のボディ (%d bytes) は変更なく転送された", len(body))
+}
+
+// TestRoundTrip_OversizedBodyRejected は sigV4RoundTripper.RoundTrip が
+// maxRequestBodyBytes を超えるボディをサイレント切り詰めせず、エラーで拒否することを確認する。
+// 切り詰めたボディに SigV4 署名して転送すると、呼び出し元の意図と異なるペイロードが
+// 正規署名付きで上流に届いてしまうため、明示的な拒否が必須。
+func TestRoundTrip_OversizedBodyRejected(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	upstreamCalled := false
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer mock.Close()
+
+	transport, err := newSigV4RoundTripper(context.Background(), "us-east-1", awsMCPService)
+	if err != nil {
+		t.Fatalf("RoundTripper 作成失敗: %v", err)
+	}
+
+	oversized := strings.Repeat("a", maxRequestBodyBytes+1)
+	req, _ := http.NewRequest(http.MethodPost, mock.URL, strings.NewReader(oversized))
+	_, err = transport.RoundTrip(req)
+	if err == nil {
+		t.Fatal("上限超過ボディがエラーにならなかった（サイレント切り詰めの疑い）")
+	}
+	if upstreamCalled {
+		t.Error("上限超過ボディが上流に転送された")
+	}
+	t.Logf("✓ 上限超過ボディが拒否された: %v", err)
 }

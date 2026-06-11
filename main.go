@@ -103,10 +103,16 @@ func (t *sigV4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	var bodyBytes []byte
 	if req.Body != nil {
 		var err error
-		// Limit to 6 MiB as a second line of defence (the handler layer applies MaxBytesReader).
-		bodyBytes, err = io.ReadAll(io.LimitReader(req.Body, 6<<20))
+		// Second line of defence (the handler layer applies MaxBytesReader):
+		// read up to limit+1 to detect oversized bodies and reject them explicitly.
+		// Silent truncation is not acceptable — the proxy would SigV4-sign and
+		// forward a payload different from what the caller sent.
+		bodyBytes, err = io.ReadAll(io.LimitReader(req.Body, maxRequestBodyBytes+1))
 		if err != nil {
 			return nil, fmt.Errorf("failed to read request body: %w", err)
+		}
+		if len(bodyBytes) > maxRequestBodyBytes {
+			return nil, fmt.Errorf("request body exceeds %d bytes limit", maxRequestBodyBytes)
 		}
 		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
