@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -392,6 +393,18 @@ func injectMetaAWSRegion(r *http.Request, region string) (*http.Request, bool) {
 	if r.Body == nil || r.Body == http.NoBody || r.ContentLength == 0 {
 		return r, true
 	}
+
+	// JSON-RPC 以外のリクエストでは JSON パースを行わず early return する（CPU 節約）。
+	// Content-Type が application/json 系でない場合は原文のまま通す。
+	// Content-Type が空のクライアントは後方互換のため従来どおりパースを試みる
+	// （MCP の Streamable HTTP は application/json を送るが、未設定クライアントを壊さない）。
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		mediaType, _, mErr := mime.ParseMediaType(ct)
+		if mErr != nil || mediaType != "application/json" {
+			return r, true
+		}
+	}
+
 	body, err := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 	if err != nil {
