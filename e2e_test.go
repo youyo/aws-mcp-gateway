@@ -2626,6 +2626,68 @@ func TestRequireEnv(t *testing.T) {
 	})
 }
 
+// TestSweepExpiredCredsCaches は sweepExpiredCredsCaches が TTL を超えたエントリのみ削除し、
+// 新鮮なエントリを保持することを確認する。
+func TestSweepExpiredCredsCaches(t *testing.T) {
+	// グローバルキャッシュをリセットし、テスト後に戻す。
+	federatedCredsCache = sync.Map{}
+	assumeRoleCredsCache = sync.Map{}
+	t.Cleanup(func() {
+		federatedCredsCache = sync.Map{}
+		assumeRoleCredsCache = sync.Map{}
+	})
+
+	now := time.Now()
+	dummyProvider := credentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+		return aws.Credentials{}, nil
+	})
+
+	// federatedCredsCache: 期限切れ1件、新鮮1件
+	expiredFedKey := "sub-expired::deadbeef0001"
+	freshFedKey := "sub-fresh::deadbeef0002"
+	federatedCredsCache.Store(expiredFedKey, &federatedCacheEntry{
+		creds:     aws.NewCredentialsCache(dummyProvider),
+		createdAt: now.Add(-2 * time.Hour),
+	})
+	federatedCredsCache.Store(freshFedKey, &federatedCacheEntry{
+		creds:     aws.NewCredentialsCache(dummyProvider),
+		createdAt: now,
+	})
+
+	// assumeRoleCredsCache: 期限切れ1件、新鮮1件
+	expiredARKey := "111::roleA::sub-expired"
+	freshARKey := "111::roleA::sub-fresh"
+	assumeRoleCredsCache.Store(expiredARKey, &assumeRoleCacheEntry{
+		creds:       aws.NewCredentialsCache(dummyProvider),
+		createdAt:   now.Add(-2 * time.Hour),
+		sessionName: "gw-ar-expired",
+	})
+	assumeRoleCredsCache.Store(freshARKey, &assumeRoleCacheEntry{
+		creds:       aws.NewCredentialsCache(dummyProvider),
+		createdAt:   now,
+		sessionName: "gw-ar-fresh",
+	})
+
+	// sweep 実行（federatedTTL=1h、assumeRoleTTL=55m）
+	sweepExpiredCredsCaches(now, 1*time.Hour, 55*time.Minute)
+
+	// 期限切れエントリが削除されていること
+	if _, ok := federatedCredsCache.Load(expiredFedKey); ok {
+		t.Errorf("federatedCredsCache: 期限切れエントリ %s が残っている", expiredFedKey)
+	}
+	if _, ok := assumeRoleCredsCache.Load(expiredARKey); ok {
+		t.Errorf("assumeRoleCredsCache: 期限切れエントリ %s が残っている", expiredARKey)
+	}
+
+	// 新鮮なエントリが保持されていること
+	if _, ok := federatedCredsCache.Load(freshFedKey); !ok {
+		t.Errorf("federatedCredsCache: 新鮮なエントリ %s が削除された", freshFedKey)
+	}
+	if _, ok := assumeRoleCredsCache.Load(freshARKey); !ok {
+		t.Errorf("assumeRoleCredsCache: 新鮮なエントリ %s が削除された", freshARKey)
+	}
+}
+
 // TestInjectMetaAWSRegion_ContentTypeGuard は Content-Type ガードの動作を検証する。
 // - 非 JSON Content-Type は素通り（注入しない）
 // - charset 付き application/json は注入される
