@@ -2626,6 +2626,83 @@ func TestRequireEnv(t *testing.T) {
 	})
 }
 
+// fakeDeadlineWriter は SetWriteDeadline を実装するテスト用偽 ResponseWriter。
+// http.NewResponseController がこのメソッドを見つけられるように writer 自身に実装する。
+type fakeDeadlineWriter struct {
+	header       http.Header
+	lastDeadline time.Time
+	deadlineSet  int
+	written      []byte
+}
+
+func (f *fakeDeadlineWriter) Header() http.Header {
+	if f.header == nil {
+		f.header = http.Header{}
+	}
+	return f.header
+}
+func (f *fakeDeadlineWriter) Write(p []byte) (int, error) {
+	f.written = append(f.written, p...)
+	return len(p), nil
+}
+func (f *fakeDeadlineWriter) WriteHeader(int) {}
+func (f *fakeDeadlineWriter) SetWriteDeadline(t time.Time) error {
+	f.lastDeadline = t
+	f.deadlineSet++
+	return nil
+}
+
+// TestWriteDeadlineResponseWriter は writeDeadlineResponseWriter の各書き込みで
+// SetWriteDeadline が呼ばれるメカニズムを決定的に検証する。
+func TestWriteDeadlineResponseWriter(t *testing.T) {
+	t.Run("Write で SetWriteDeadline が呼ばれ deadline が now+idleTimeout 以内", func(t *testing.T) {
+		fake := &fakeDeadlineWriter{}
+		const idleTimeout = 100 * time.Millisecond
+		w := newWriteDeadlineResponseWriter(fake, idleTimeout)
+
+		n, err := w.Write([]byte("hello"))
+		if err != nil {
+			t.Fatalf("Write エラー: %v", err)
+		}
+		if n != 5 {
+			t.Errorf("Write n = %d, want 5", n)
+		}
+
+		if fake.deadlineSet < 1 {
+			t.Errorf("SetWriteDeadline が呼ばれていない (呼び出し回数=%d)", fake.deadlineSet)
+		}
+		remaining := time.Until(fake.lastDeadline)
+		// deadline は now+idleTimeout に近い値のはず（0 < remaining <= idleTimeout + 1s の緩いバウンド）
+		if remaining <= 0 {
+			t.Errorf("deadline が過去: time.Until(deadline) = %v", remaining)
+		}
+		upper := idleTimeout + 1*time.Second // テスト実行の遅延を考慮した緩いバウンド
+		if remaining > upper {
+			t.Errorf("deadline が遠すぎる: time.Until(deadline) = %v, want <= %v", remaining, upper)
+		}
+		t.Logf("✓ SetWriteDeadline 呼び出し回数=%d deadline 残り=%v", fake.deadlineSet, remaining)
+	})
+
+	t.Run("Unwrap が下層の ResponseWriter を返す", func(t *testing.T) {
+		fake := &fakeDeadlineWriter{}
+		w := newWriteDeadlineResponseWriter(fake, 100*time.Millisecond)
+		if w.Unwrap() != fake {
+			t.Errorf("Unwrap() が fake を返さない: got %v", w.Unwrap())
+		}
+		t.Logf("✓ Unwrap() が下層の ResponseWriter を返した")
+	})
+
+	t.Run("WriteHeader でも SetWriteDeadline が呼ばれる", func(t *testing.T) {
+		fake := &fakeDeadlineWriter{}
+		w := newWriteDeadlineResponseWriter(fake, 100*time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		if fake.deadlineSet < 1 {
+			t.Errorf("WriteHeader 後に SetWriteDeadline が呼ばれていない (呼び出し回数=%d)", fake.deadlineSet)
+		}
+		t.Logf("✓ WriteHeader でも SetWriteDeadline が呼ばれた (回数=%d)", fake.deadlineSet)
+	})
+}
+
 // TestSweepExpiredCredsCaches は sweepExpiredCredsCaches が TTL を超えたエントリのみ削除し、
 // 新鮮なエントリを保持することを確認する。
 func TestSweepExpiredCredsCaches(t *testing.T) {

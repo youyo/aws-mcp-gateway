@@ -514,8 +514,59 @@ func newStore(ctx context.Context) (idproxy.Store, error) {
 	}
 }
 
-func buildProxy(target *url.URL, transport http.RoundTripper) *httputil.ReverseProxy {
-	return &httputil.ReverseProxy{
+// sseWriteIdleTimeout は SSE / Streamable HTTP レスポンスのアイドル書き込み期限。
+// クライアントが読み取りを停止すると、この時間で書き込みが失敗し goroutine リークを防ぐ。
+// 書き込みごとに期限をリセットする（ロールング）ため、正常な長時間ストリームは切断されない。
+const sseWriteIdleTimeout = 120 * time.Second
+
+// writeDeadlineResponseWriter は各書き込みでロールング書き込み期限を設定する ResponseWriter ラッパー。
+// サーバーレベル WriteTimeout は SSE 全体を一律に切断するため使えない。代わりに
+// 接続単位で「アイドル」期限を設け、クライアントが idleTimeout の間読み取らなければ
+// 次の書き込みが期限切れで失敗し、プロキシの goroutine がアンワインドされる。
+type writeDeadlineResponseWriter struct {
+	http.ResponseWriter
+	rc          *http.ResponseController
+	idleTimeout time.Duration
+}
+
+func newWriteDeadlineResponseWriter(w http.ResponseWriter, idleTimeout time.Duration) *writeDeadlineResponseWriter {
+	return &writeDeadlineResponseWriter{
+		ResponseWriter: w,
+		rc:             http.NewResponseController(w),
+		idleTimeout:    idleTimeout,
+	}
+}
+
+// bump はアイドル書き込み期限を now+idleTimeout に更新する。
+// SetWriteDeadline 非対応の ResponseWriter（テストの ResponseRecorder 等）では
+// エラーが返るが無視する（その場合は期限制御が効かないだけで動作は継続する）。
+func (w *writeDeadlineResponseWriter) bump() {
+	_ = w.rc.SetWriteDeadline(time.Now().Add(w.idleTimeout))
+}
+
+func (w *writeDeadlineResponseWriter) Write(p []byte) (int, error) {
+	w.bump()
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *writeDeadlineResponseWriter) WriteHeader(statusCode int) {
+	w.bump()
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+// Flush は ReverseProxy の FlushInterval=-1（SSE 即時フラッシュ）に対応する。
+func (w *writeDeadlineResponseWriter) Flush() {
+	_ = w.rc.Flush()
+}
+
+// Unwrap は http.NewResponseController が下層の ResponseWriter に到達できるようにする。
+// これが無いと SetWriteDeadline / Flush が "not supported" になる。
+func (w *writeDeadlineResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func buildProxy(target *url.URL, transport http.RoundTripper) http.Handler {
+	rp := &httputil.ReverseProxy{
 		Transport:     transport,
 		FlushInterval: -1, // flush immediately for SSE / Streamable HTTP
 		Rewrite: func(r *httputil.ProxyRequest) {
@@ -541,6 +592,9 @@ func buildProxy(target *url.URL, transport http.RoundTripper) *httputil.ReverseP
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 		},
 	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rp.ServeHTTP(newWriteDeadlineResponseWriter(w, sseWriteIdleTimeout), r)
+	})
 }
 
 // federatedConfig は federated モード固有の設定値をまとめる。
