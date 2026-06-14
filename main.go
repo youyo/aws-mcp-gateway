@@ -475,7 +475,10 @@ func newStore(ctx context.Context) (idproxy.Store, error) {
 	backend := getEnvOrDefault("STORE_BACKEND", "memory")
 	switch backend {
 	case "dynamodb":
-		table := mustEnv("DYNAMODB_TABLE")
+		table, err := requireEnv("DYNAMODB_TABLE")
+		if err != nil {
+			return nil, err
+		}
 		region := getEnvOrDefault("DYNAMODB_REGION", "ap-northeast-1")
 		slog.Info("using DynamoDB session store", "table", table, "region", region)
 		return store.NewDynamoDBStore(table, region)
@@ -628,13 +631,15 @@ func loadSigningKey() (*ecdsa.PrivateKey, error) {
 	return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 }
 
-func mustEnv(key string) string {
+// requireEnv は必須の環境変数を取得する。未設定なら error を返す。
+// os.Exit せずエラーを返すことで、呼び出し元（main / newStore）でハンドリングでき、
+// 統合テストでテストプロセスごと終了する問題を避ける。
+func requireEnv(key string) (string, error) {
 	v := os.Getenv(key)
 	if v == "" {
-		slog.Error("required environment variable not set", "key", key)
-		os.Exit(1)
+		return "", fmt.Errorf("required environment variable not set: %s", key)
 	}
-	return v
+	return v, nil
 }
 
 func getEnvOrDefault(key, def string) string {
@@ -659,10 +664,23 @@ func main() {
 	}
 	targetAWSRegion := getEnvOrDefault("TARGET_AWS_REGION", defaultTargetAWSRegion)
 	port := getEnvOrDefault("PORT", defaultListenPort)
-	externalURL := mustEnv("EXTERNAL_URL")
-	oidcIssuer := mustEnv("OIDC_ISSUER")
-	oidcClientID := mustEnv("OIDC_CLIENT_ID")
-	oidcClientSecret := mustEnv("OIDC_CLIENT_SECRET")
+	// 必須環境変数をまとめて取得し、未設定があれば全てを報告して終了する。
+	var missingEnv []string
+	getRequired := func(key string) string {
+		v, err := requireEnv(key)
+		if err != nil {
+			missingEnv = append(missingEnv, key)
+		}
+		return v
+	}
+	externalURL := getRequired("EXTERNAL_URL")
+	oidcIssuer := getRequired("OIDC_ISSUER")
+	oidcClientID := getRequired("OIDC_CLIENT_ID")
+	oidcClientSecret := getRequired("OIDC_CLIENT_SECRET")
+	if len(missingEnv) > 0 {
+		slog.Error("required environment variables not set", "keys", missingEnv)
+		os.Exit(1)
+	}
 	allowedDomains := os.Getenv("ALLOWED_DOMAINS")
 	allowedEmails := os.Getenv("ALLOWED_EMAILS")
 	// Check the parsed result (not the raw strings) to catch whitespace-only values.
