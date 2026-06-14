@@ -2598,6 +2598,34 @@ func TestRoundTrip_OversizedBodyRejected(t *testing.T) {
 	t.Logf("✓ 上限超過ボディが拒否された: %v", err)
 }
 
+func TestRequireEnv(t *testing.T) {
+	t.Run("設定済みは値を返す", func(t *testing.T) {
+		t.Setenv("TEST_REQUIRE_ENV_SET", "hello")
+		got, err := requireEnv("TEST_REQUIRE_ENV_SET")
+		if err != nil {
+			t.Fatalf("エラーが返ったが期待しない: %v", err)
+		}
+		if got != "hello" {
+			t.Errorf("got %q, want %q", got, "hello")
+		}
+	})
+
+	t.Run("未設定は error を返す", func(t *testing.T) {
+		key := "TEST_REQUIRE_ENV_UNSET_XYZ"
+		_ = os.Unsetenv(key)
+		got, err := requireEnv(key)
+		if err == nil {
+			t.Fatal("エラーが返らなかったが期待する")
+		}
+		if got != "" {
+			t.Errorf("値が空文字列でない: %q", got)
+		}
+		if !strings.Contains(err.Error(), key) {
+			t.Errorf("エラーメッセージにキー名が含まれない: %v", err)
+		}
+	})
+}
+
 // TestInjectMetaAWSRegion_ContentTypeGuard は Content-Type ガードの動作を検証する。
 // - 非 JSON Content-Type は素通り（注入しない）
 // - charset 付き application/json は注入される
