@@ -154,7 +154,14 @@ var sigV4HTTPTransport = func() *http.Transport {
 	return tr
 }()
 
-// federatedCredsCache はユーザーごとの CredentialsCache をキャッシュする。
+// federatedCacheEntry は federatedCredsCache のエントリ。
+// 定期 sweep で経過時間を判定するため createdAt を保持する。
+type federatedCacheEntry struct {
+	creds     *aws.CredentialsCache
+	createdAt time.Time
+}
+
+// federatedCredsCache はユーザーごとの *federatedCacheEntry をキャッシュする。
 // キー: "sub::tokenFingerprint"（16桁の sha256 hex）
 // 同一トークンに対してリクエストごとに STS を呼ぶことを防ぐ。
 var federatedCredsCache sync.Map
@@ -214,8 +221,8 @@ func getFederatedCreds(ctx context.Context, region, roleARN, idToken, sub, email
 	}
 
 	if cached, ok := federatedCredsCache.Load(cacheKey); ok {
-		creds := cached.(*aws.CredentialsCache)
-		return creds, cacheKey, nil
+		entry := cached.(*federatedCacheEntry)
+		return entry.creds, cacheKey, nil
 	}
 
 	// cache miss: 同一 sub で異なるトークン fingerprint のエントリを削除（メモリリーク防止）。
@@ -266,8 +273,11 @@ func getFederatedCreds(ctx context.Context, region, roleARN, idToken, sub, email
 	newCreds := aws.NewCredentialsCache(credsProvider)
 	// LoadOrStore で thundering herd を緩和: 並列リクエストが同時に到達した場合、
 	// 先にストアされたエントリを使い、重複ストアを防ぐ。
-	actual, _ := federatedCredsCache.LoadOrStore(cacheKey, newCreds)
-	creds := actual.(*aws.CredentialsCache)
+	actual, _ := federatedCredsCache.LoadOrStore(cacheKey, &federatedCacheEntry{
+		creds:     newCreds,
+		createdAt: time.Now(),
+	})
+	creds := actual.(*federatedCacheEntry).creds
 
 	return creds, cacheKey, nil
 }
@@ -859,6 +869,13 @@ func main() {
 		"oidc_issuer", oidcIssuer,
 	)
 
+	startCredsCacheSweeper(ctx, credsCacheSweepInterval, federatedCredsCacheTTL, assumeRoleCfg.maxCacheTTL)
+	slog.Info("credentials cache sweeper started",
+		"interval", credsCacheSweepInterval,
+		"federated_ttl", federatedCredsCacheTTL,
+		"assume_role_ttl", assumeRoleCfg.maxCacheTTL,
+	)
+
 	srv := &http.Server{
 		Addr:              ":" + port,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -884,6 +901,40 @@ type assumeRoleCacheEntry struct {
 // assumeRoleCredsCache はユーザー×ロールごとの *assumeRoleCacheEntry をキャッシュする。
 // キー: "{account_id}::{role_name}::{subject}"
 var assumeRoleCredsCache sync.Map
+
+// sweepExpiredCredsCaches は createdAt が TTL を超えたキャッシュエントリを削除する。
+// 定期実行され、別ユーザー・別ロールの古いエントリ（Range パージが届かないもの）を回収する。
+// comma-ok アサーションで未知の値型（テストが格納するダミー文字列等）を安全にスキップする。
+func sweepExpiredCredsCaches(now time.Time, federatedTTL, assumeRoleTTL time.Duration) {
+	federatedCredsCache.Range(func(k, v any) bool {
+		if e, ok := v.(*federatedCacheEntry); ok && now.Sub(e.createdAt) > federatedTTL {
+			federatedCredsCache.Delete(k)
+		}
+		return true
+	})
+	assumeRoleCredsCache.Range(func(k, v any) bool {
+		if e, ok := v.(*assumeRoleCacheEntry); ok && now.Sub(e.createdAt) > assumeRoleTTL {
+			assumeRoleCredsCache.Delete(k)
+		}
+		return true
+	})
+}
+
+// startCredsCacheSweeper は定期的に sweepExpiredCredsCaches を呼ぶ goroutine を起動する。
+func startCredsCacheSweeper(ctx context.Context, interval, federatedTTL, assumeRoleTTL time.Duration) {
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sweepExpiredCredsCaches(time.Now(), federatedTTL, assumeRoleTTL)
+			}
+		}
+	}()
+}
 
 // buildAssumeRoleARN は accountID と roleName から IAM ロール ARN を生成する。
 func buildAssumeRoleARN(accountID, roleName string) string {
@@ -1011,6 +1062,13 @@ type assumeRoleConfig struct {
 const (
 	defaultAssumeRoleMaxCacheTTL = 55 * time.Minute
 	minAssumeRoleMaxCacheTTL     = 5 * time.Minute
+
+	// credsCacheSweepInterval は credentials キャッシュの定期 sweep 間隔。
+	credsCacheSweepInterval = 10 * time.Minute
+	// federatedCredsCacheTTL は federatedCredsCache エントリの最大保持時間。
+	// 離脱ユーザーのエントリ回収用。アクティブユーザーは WebIdentity で再認証され、
+	// 約 1 時間に 1 回 STS 呼び出しが増える程度（assumeRole の maxCacheTTL 退避と同等の方針）。
+	federatedCredsCacheTTL = 1 * time.Hour
 )
 
 func loadAssumeRoleConfig() assumeRoleConfig {
