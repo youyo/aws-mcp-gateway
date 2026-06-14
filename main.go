@@ -21,6 +21,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
@@ -28,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -133,26 +135,28 @@ func (t *sigV4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 }
 
 // sigV4HTTPTransport は SigV4 署名リクエスト用の共有 HTTP Transport。
-// http.DefaultTransport を clone して HTTP_PROXY/HTTPS_PROXY 環境変数や
-// TLS 設定を保持しつつ、本番運用向けにタイムアウトと接続プールを設定する。
+// http.DefaultTransport に依存せず必要なフィールドを明示的に設定した
+// 新規インスタンスを生成する。これにより、プロセス内で DefaultTransport の
+// 設定が変更されても（テストや外部ライブラリ経由）影響を受けない。
+// HTTP_PROXY/HTTPS_PROXY 環境変数対応のため Proxy: http.ProxyFromEnvironment を設定する。
 // HTTP/1.1 固定: mcp-proxy-for-aws と挙動を揃える（HTTP/2 ネゴシエーション不要）。
-var sigV4HTTPTransport = func() *http.Transport {
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.DialContext = (&net.Dialer{
+var sigV4HTTPTransport = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialContext: (&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
-	}).DialContext
-	tr.MaxIdleConns = 100
-	tr.MaxIdleConnsPerHost = 20
-	tr.IdleConnTimeout = 90 * time.Second
-	tr.TLSHandshakeTimeout = 10 * time.Second
-	tr.ResponseHeaderTimeout = 60 * time.Second
-	tr.ForceAttemptHTTP2 = false
-	// Clone the TLS config to avoid mutating DefaultTransport's shared instance.
-	tr.TLSClientConfig = tr.TLSClientConfig.Clone()
-	tr.TLSClientConfig.NextProtos = []string{"http/1.1"}
-	return tr
-}()
+	}).DialContext,
+	ForceAttemptHTTP2:     false,
+	MaxIdleConns:          100,
+	MaxIdleConnsPerHost:   20,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	ResponseHeaderTimeout: 60 * time.Second,
+	TLSClientConfig: &tls.Config{
+		NextProtos: []string{"http/1.1"},
+	},
+}
 
 // federatedCredsCache はユーザーごとの CredentialsCache をキャッシュする。
 // キー: "sub::tokenFingerprint"（16桁の sha256 hex）
@@ -389,6 +393,18 @@ func injectMetaAWSRegion(r *http.Request, region string) (*http.Request, bool) {
 	if r.Body == nil || r.Body == http.NoBody || r.ContentLength == 0 {
 		return r, true
 	}
+
+	// JSON-RPC 以外のリクエストでは JSON パースを行わず early return する（CPU 節約）。
+	// Content-Type が application/json 系でない場合は原文のまま通す。
+	// Content-Type が空のクライアントは後方互換のため従来どおりパースを試みる
+	// （MCP の Streamable HTTP は application/json を送るが、未設定クライアントを壊さない）。
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		mediaType, _, mErr := mime.ParseMediaType(ct)
+		if mErr != nil || mediaType != "application/json" {
+			return r, true
+		}
+	}
+
 	body, err := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 	if err != nil {
