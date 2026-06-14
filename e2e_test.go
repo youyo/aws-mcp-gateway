@@ -2503,6 +2503,66 @@ func TestRoundTrip_SmallBodyPassesThrough(t *testing.T) {
 	t.Logf("✓ 上限未満のボディ (%d bytes) は変更なく転送された", len(body))
 }
 
+// TestSigV4HTTPTransport_ExplicitConfig は sigV4HTTPTransport が http.DefaultTransport に
+// 依存せず明示的に設定された新規インスタンスであることを確認する回帰テスト。
+func TestSigV4HTTPTransport_ExplicitConfig(t *testing.T) {
+	// ProxyFromEnvironment が設定されていること（関数値なので非 nil のみ確認）
+	if sigV4HTTPTransport.Proxy == nil {
+		t.Fatal("Proxy が nil: http.ProxyFromEnvironment が設定されていること")
+	}
+
+	// HTTP/1.1 固定: ForceAttemptHTTP2 が false
+	if sigV4HTTPTransport.ForceAttemptHTTP2 {
+		t.Error("ForceAttemptHTTP2 が true: false であるべき")
+	}
+
+	// 接続プール設定
+	if sigV4HTTPTransport.MaxIdleConns != 100 {
+		t.Errorf("MaxIdleConns = %d, want 100", sigV4HTTPTransport.MaxIdleConns)
+	}
+	if sigV4HTTPTransport.MaxIdleConnsPerHost != 20 {
+		t.Errorf("MaxIdleConnsPerHost = %d, want 20", sigV4HTTPTransport.MaxIdleConnsPerHost)
+	}
+
+	// タイムアウト設定
+	if sigV4HTTPTransport.IdleConnTimeout != 90*time.Second {
+		t.Errorf("IdleConnTimeout = %v, want 90s", sigV4HTTPTransport.IdleConnTimeout)
+	}
+	if sigV4HTTPTransport.TLSHandshakeTimeout != 10*time.Second {
+		t.Errorf("TLSHandshakeTimeout = %v, want 10s", sigV4HTTPTransport.TLSHandshakeTimeout)
+	}
+	if sigV4HTTPTransport.ResponseHeaderTimeout != 60*time.Second {
+		t.Errorf("ResponseHeaderTimeout = %v, want 60s", sigV4HTTPTransport.ResponseHeaderTimeout)
+	}
+	if sigV4HTTPTransport.ExpectContinueTimeout != 1*time.Second {
+		t.Errorf("ExpectContinueTimeout = %v, want 1s", sigV4HTTPTransport.ExpectContinueTimeout)
+	}
+
+	// DialContext が設定されていること
+	if sigV4HTTPTransport.DialContext == nil {
+		t.Fatal("DialContext が nil: net.Dialer.DialContext が設定されていること")
+	}
+
+	// TLSClientConfig と NextProtos の確認
+	if sigV4HTTPTransport.TLSClientConfig == nil {
+		t.Fatal("TLSClientConfig が nil")
+	}
+	if len(sigV4HTTPTransport.TLSClientConfig.NextProtos) != 1 || sigV4HTTPTransport.TLSClientConfig.NextProtos[0] != "http/1.1" {
+		t.Errorf("TLSClientConfig.NextProtos = %v, want [\"http/1.1\"]", sigV4HTTPTransport.TLSClientConfig.NextProtos)
+	}
+
+	// 独立性: http.DefaultTransport と異なるポインタであること
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		t.Skip("http.DefaultTransport が *http.Transport でない（テスト環境の問題）")
+	}
+	if sigV4HTTPTransport == defaultTransport {
+		t.Fatal("sigV4HTTPTransport が http.DefaultTransport と同一ポインタ: 独立した新規インスタンスであるべき")
+	}
+
+	t.Logf("✓ sigV4HTTPTransport は http.DefaultTransport と独立した明示的設定の新規インスタンス")
+}
+
 // TestRoundTrip_OversizedBodyRejected は sigV4RoundTripper.RoundTrip が
 // maxRequestBodyBytes を超えるボディをサイレント切り詰めせず、エラーで拒否することを確認する。
 // 切り詰めたボディに SigV4 署名して転送すると、呼び出し元の意図と異なるペイロードが
